@@ -1,3 +1,4 @@
+# HOT
 $TOKEN='***REMOVED***'
 $CHAT_ID='143293811'
 $API = "https://api.telegram.org/bot$TOKEN"
