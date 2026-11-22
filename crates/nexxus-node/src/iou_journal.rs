@@ -70,7 +70,7 @@ impl IouJournal {
     /// Append one IOU, fsync, return Ok(()) — or Replay if (debtor, nonce) already seen.
     pub fn append(&self, iou: &Iou, seen: &mut Seen) -> Result<(), JournalError> {
         let key = (iou.debtor.0, iou.nonce);
-        if !seen.insert(key) {
+        if seen.contains(&key) {
             return Err(JournalError::Replay(hex32(&iou.debtor.0)));
         }
         let mut f = OpenOptions::new()
@@ -82,6 +82,9 @@ impl IouJournal {
         let line = format!("{}\n", iou.to_json());
         f.write_all(line.as_bytes()).map_err(|e| JournalError::Io(e.to_string()))?;
         f.sync_all().map_err(|e| JournalError::Io(e.to_string()))?;
+        // M-19: nonce помечаем "виденным" ТОЛЬКО после успешной записи+fsync,
+        // иначе при ошибке записи он блокируется до рестарта.
+        seen.insert(key);
         Ok(())
     }
 
@@ -114,11 +117,11 @@ impl IouJournal {
     /// Total outstanding for a creditor (sum of valid, non-expired IOUs where we are debtor).
     pub fn balance_owed(&self, creditor: &nexxus_core::types::NodeId, now_unix: u64) -> Result<i64, JournalError> {
         let (ious, _, _) = self.load()?;
-        Ok(ious
-            .iter()
-            .filter(|i| i.creditor == *creditor && now_unix <= i.expiry_unix)
-            .map(|i| i.amount_micro)
-            .sum())
+        let mut total: i64 = 0;
+        for i in ious.iter().filter(|i| i.creditor == *creditor && now_unix <= i.expiry_unix) {
+            total = total.checked_add(i.amount_micro).ok_or(JournalError::Io("balance overflow".into()))?;
+        }
+        Ok(total)
     }
 }
 

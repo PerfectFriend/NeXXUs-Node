@@ -13,6 +13,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
+use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,8 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::error::NexxusError;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Итерации PBKDF2 для НОВЫХ vault (OWASP 2023 для HMAC-SHA256).
 pub const PBKDF2_ROUNDS: u32 = 600_000;
@@ -43,9 +46,10 @@ pub struct EncryptedVault {
     pub created_at: u64,
     #[serde(default = "default_kdf_rounds")]
     pub kdf_rounds: u32,
-    /// C-4: алгоритм хеша PIN. `None` = legacy SHA-256(PIN||salt) из SDK
-    /// (оставлен только для чтения старых vault); новые vault получают
-    /// `Some("pbkdf2-sha256-<rounds>")` — перебор PIN тогда стоит как KDF.
+    /// C-4 & C-9: алгоритм хеша/верификатора PIN.
+    /// `None` = legacy SHA-256(PIN||salt) из SDK;
+    /// `pbkdf2-sha256-<rounds>` = legacy C-4 (уязвимый: hash == key);
+    /// `pbkdf2-hmac-sha256-v2-<rounds>` = C-9 исправленный (с domain separation).
     #[serde(default)]
     pub pin_hash_algo: Option<String>,
 }
@@ -73,7 +77,7 @@ pub struct DecryptResult {
 }
 
 /// SHA-256(PIN || salt) в hex — legacy-формат хеша как в SDK.
-/// НЕ использовать для новых vault (C-4): перебирается мгновенно.
+/// НЕ использовать для новых vault: перебирается мгновенно.
 pub fn hash_pin(pin: &str, salt: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(pin.as_bytes());
@@ -81,9 +85,36 @@ pub fn hash_pin(pin: &str, salt: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// C-4: хеш PIN через PBKDF2-HMAC-SHA256 с теми же rounds, что и KDF шифра —
-/// быстрый перебор PIN (как по голому SHA-256) больше не работает.
-fn pin_hash_kdf(pin: &str, salt: &[u8], rounds: u32) -> String {
+/// C-9: HKDF/HMAC расширение ключа с разделением доменов (domain separation).
+fn kdf_expand(master: &[u8], info: &[u8]) -> [u8; 32] {
+    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(master).expect("HMAC can take key of any size");
+    mac.update(info);
+    let result = mac.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result.into_bytes());
+    out
+}
+
+/// C-9: Выводит криптографически независимые ключи (шифрования и верификатора PIN)
+/// из мастер-секрета через PBKDF2 + HMAC-SHA256. Хеш верификатора PIN в JSON
+/// кардинально отличается от ключа шифрования AES-256-GCM.
+fn derive_keys_v2(pin: &str, salt: &[u8], rounds: u32) -> ([u8; 32], [u8; 32]) {
+    let mut master = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(pin.as_bytes(), salt, rounds, &mut master);
+    let enc_key = kdf_expand(&master, b"nexxus-vault-encryption-key-v2");
+    let verifier = kdf_expand(&master, b"nexxus-vault-pin-verifier-v2");
+    master.zeroize();
+    (enc_key, verifier)
+}
+
+/// C-9: Выводит только верификатор PIN для v2 (безопасный verifier).
+fn derive_verifier_v2(pin: &str, salt: &[u8], rounds: u32) -> String {
+    let (_, verifier) = derive_keys_v2(pin, salt, rounds);
+    hex::encode(verifier)
+}
+
+/// Legacy C-4 pin_hash (только для обратной совместимости старых vault при чтении).
+fn pin_hash_kdf_legacy(pin: &str, salt: &[u8], rounds: u32) -> String {
     let mut h = [0u8; 32];
     pbkdf2_hmac::<Sha256>(pin.as_bytes(), salt, rounds, &mut h);
     hex::encode(h)
@@ -92,15 +123,19 @@ fn pin_hash_kdf(pin: &str, salt: &[u8], rounds: u32) -> String {
 /// Хеш введённого PIN в формате, ожидаемом данным vault (с учётом algo).
 fn entered_pin_hash(vault: &EncryptedVault, pin: &str, salt: &[u8]) -> String {
     match vault.pin_hash_algo.as_deref() {
+        Some(a) if a.starts_with("pbkdf2-hmac-sha256-v2-") => {
+            let rounds: u32 = a["pbkdf2-hmac-sha256-v2-".len()..].parse().unwrap_or(PBKDF2_ROUNDS);
+            derive_verifier_v2(pin, salt, rounds)
+        }
         Some(a) if a.starts_with("pbkdf2-sha256-") => {
             let rounds: u32 = a["pbkdf2-sha256-".len()..].parse().unwrap_or(PBKDF2_ROUNDS);
-            pin_hash_kdf(pin, salt, rounds)
+            pin_hash_kdf_legacy(pin, salt, rounds)
         }
         _ => hash_pin(pin, salt),
     }
 }
 
-/// 256-битный ключ из PIN через PBKDF2-HMAC-SHA256 с заданным числом раундов.
+/// Legacy 256-битный ключ из PIN через PBKDF2-HMAC-SHA256 (для старых SDK vault).
 fn derive_key(pin: &str, salt: &[u8], rounds: u32) -> [u8; 32] {
     let mut key = [0u8; 32];
     pbkdf2_hmac::<Sha256>(pin.as_bytes(), salt, rounds, &mut key);
@@ -116,9 +151,7 @@ pub fn encrypt_vault_payload(
     encrypt_vault_payload_rounds(payload, primary_pin, duress_pin, PBKDF2_ROUNDS)
 }
 
-/// VLT-02: то же, что `encrypt_vault_payload`, но с явным числом раундов KDF.
-/// Используется для миграции старых (SDK, 100k) vault на 600k и в тестах —
-/// в обычном коде всегда вызывайте `encrypt_vault_payload`.
+/// VLT-02 & C-9: то же, что `encrypt_vault_payload`, но с явным числом раундов KDF.
 pub fn encrypt_vault_payload_rounds(
     payload: &[u8],
     primary_pin: &str,
@@ -132,7 +165,7 @@ pub fn encrypt_vault_payload_rounds(
     rng.fill(&mut salt[..]);
     rng.fill(&mut nonce_bytes[..]);
 
-    let mut key = derive_key(primary_pin, &salt, rounds);
+    let (mut key, verifier) = derive_keys_v2(primary_pin, &salt, rounds);
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|e| NexxusError::Vault(format!("инициализация шифра: {e}")))?;
 
@@ -142,18 +175,20 @@ pub fn encrypt_vault_payload_rounds(
         .map_err(|e| NexxusError::Vault(format!("шифрование: {e}")))?;
     key.zeroize();
 
+    let duress_hash_hex = duress_pin.map(|dp| derive_verifier_v2(dp, &salt, rounds));
+
     let vault = EncryptedVault {
         ciphertext_hex: hex::encode(ciphertext),
         iv_hex: hex::encode(nonce_bytes),
         salt_hex: hex::encode(salt),
-        pin_hash_hex: pin_hash_kdf(primary_pin, &salt, rounds),
-        duress_hash_hex: duress_pin.map(|dp| pin_hash_kdf(dp, &salt, rounds)),
+        pin_hash_hex: hex::encode(verifier),
+        duress_hash_hex,
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         kdf_rounds: rounds,
-        pin_hash_algo: Some(format!("pbkdf2-sha256-{rounds}")),
+        pin_hash_algo: Some(format!("pbkdf2-hmac-sha256-v2-{rounds}")),
     };
 
     serde_json::to_string(&vault).map_err(|e| NexxusError::Vault(format!("сериализация: {e}")))
@@ -205,7 +240,15 @@ pub fn decrypt_vault_payload(vault_json: &str, entered_pin: &str) -> Result<Decr
         return Err(NexxusError::Vault("неверный PIN".into()));
     }
 
-    let mut key = derive_key(entered_pin, &salt, vault.kdf_rounds);
+    let mut key = match vault.pin_hash_algo.as_deref() {
+        Some(a) if a.starts_with("pbkdf2-hmac-sha256-v2-") => {
+            let (enc_key, _) = derive_keys_v2(entered_pin, &salt, vault.kdf_rounds);
+            enc_key
+        }
+        _ => {
+            derive_key(entered_pin, &salt, vault.kdf_rounds)
+        }
+    };
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|e| NexxusError::Vault(format!("инициализация шифра: {e}")))?;
     let nonce = Nonce::from_slice(&iv_bytes);
@@ -248,6 +291,20 @@ mod tests {
         assert!(decrypt_vault_payload(&vault, "2222").is_err());
         assert_eq!(check_pin(&vault, "2222").unwrap(), PinCheck::Wrong);
         assert_eq!(check_pin(&vault, "1111").unwrap(), PinCheck::Ok);
+    }
+
+    #[test]
+    fn vault_file_does_not_contain_encryption_key() {
+        let v = encrypt_vault_payload(b"secret", "4821", None).unwrap();
+        let j: serde_json::Value = serde_json::from_str(&v).unwrap();
+        let key = hex::decode(j["pin_hash_hex"].as_str().unwrap()).unwrap();
+        let c = Aes256Gcm::new_from_slice(&key).unwrap();
+        let nonce = hex::decode(j["iv_hex"].as_str().unwrap()).unwrap();
+        let ct = hex::decode(j["ciphertext_hex"].as_str().unwrap()).unwrap();
+        assert!(
+            c.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).is_err(),
+            "CRITICAL C-9: pin_hash_hex is the AES key!"
+        );
     }
 
     #[test]

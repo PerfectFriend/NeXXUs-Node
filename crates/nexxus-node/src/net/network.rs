@@ -266,7 +266,7 @@ impl P2pNetwork {
     /// Create from existing keys with an auditor registry (tests / committee setup).
     #[cfg(test)]
     pub fn with_auditors(
-        our_id: NodeId,
+        _our_id: NodeId,
         listen_addr: SocketAddr,
         store: Arc<ChunkStore>,
         auditors: Vec<VerifyingKey>,
@@ -274,6 +274,7 @@ impl P2pNetwork {
     ) -> Self {
         let mut os_rng = rand::rngs::OsRng;
         let identity = Identity::generate();
+        let our_id = identity.node_id();
         let mut x25519_secret = [0u8; 32];
         os_rng.fill(&mut x25519_secret);
         let x25519_pub = nexxus_core::wire::payloads::X25519_BASEPOINT.mul_clamped(x25519_secret);
@@ -314,7 +315,7 @@ impl P2pNetwork {
     }
     /// Create from existing keys with auditor registry.
     pub fn with_keys_and_auditors(
-        our_id: NodeId,
+        _our_id: NodeId,
         identity: Identity,
         x25519_secret: [u8; 32],
         listen_addr: SocketAddr,
@@ -322,6 +323,7 @@ impl P2pNetwork {
         auditors: Vec<VerifyingKey>,
         threshold: usize,
     ) -> Self {
+        let our_id = identity.node_id();
         let x25519_pub = nexxus_core::wire::payloads::X25519_BASEPOINT.mul_clamped(x25519_secret);
         Self {
             our_id,
@@ -549,6 +551,15 @@ impl P2pNetwork {
             )));
         }
         let their = NodeAnnounce::decode(&payload)?;
+        // H-3: Enforce cryptographic binding: node_id MUST equal SHA256(pubkey)
+        let expected_node_id: [u8; 32] = sha2::Sha256::digest(their.pubkey).into();
+        if their.node_id != expected_node_id {
+            return Err(NexxusError::Io(format!(
+                "H-3: node_id mismatch: announce claimed {}, expected from pubkey {}",
+                hex::encode(their.node_id),
+                hex::encode(expected_node_id)
+            )));
+        }
         // Verify the reply's signature: the announce binds the peer's pubkey
         // and its session nonce to this connection.
         let vk = VerifyingKey::from_bytes(&their.pubkey)
@@ -949,6 +960,14 @@ impl P2pNetwork {
                     // nonce travel inside the payload and are bound to this
                     // frame by the frame's own signature.
                     let announce = NodeAnnounce::decode(&payload)?;
+                    // H-3: Enforce cryptographic binding: node_id MUST equal SHA256(pubkey)
+                    let expected_node_id: [u8; 32] = sha2::Sha256::digest(announce.pubkey).into();
+                    if announce.node_id != expected_node_id {
+                        self.metrics.announce_rejected.fetch_add(1, Ordering::Relaxed);
+                        let err = ErrorResponse { code: 0x0008, message: "H-3: node_id does not match SHA256(pubkey)".into() };
+                        self.send_signed_frame(&mut stream, &our_nonce, Opcode::ErrorResponse, req_id, &err).await?;
+                        return Err(NexxusError::Io("H-3: node_id does not match SHA256(pubkey)".into()));
+                    }
                     let vk = VerifyingKey::from_bytes(&announce.pubkey)
                         .map_err(|e| NexxusError::Io(format!("bad announce pubkey: {e}")))?;
                     let msg = v3_signing_bytes(opcode, req_id, &payload, &announce.session_nonce);
@@ -1001,12 +1020,11 @@ impl P2pNetwork {
                                 return Err(NexxusError::Io("peer table full".into()));
                             }
                         }
+                        // H-3: Bind peer to verified connection socket IP, preventing unverified IP announce spoofing
+                        let peer_port = if announce.port > 0 { announce.port } else { addr_clone.port() };
                         routing.insert(crate::net::routing::Peer {
                             node_id: their_id,
-                            addr: SocketAddr::new(
-                                IpAddr::V4(std::net::Ipv4Addr::from(announce.ip)),
-                                announce.port,
-                            ),
+                            addr: SocketAddr::new(addr_clone.ip(), peer_port),
                         });
                     }
                     peer.node_id = Some(their_id);
@@ -1574,7 +1592,7 @@ mod tests {
 
         // client announces, server responds with its own NodeAnnounce
         let their_id = net.send_node_announce(listener_addr).await.unwrap();
-        assert_eq!(their_id, our_id);
+        assert_eq!(their_id, net.our_id());
 
         server.abort();
     }
@@ -1872,24 +1890,24 @@ mod tests {
         // Daemon A
         let dir_a = tempdir().unwrap();
         let store_a = Arc::new(ChunkStore::open(dir_a.path().join("store.redb")).unwrap());
-        let id_a = NodeId([0x61u8; 32]);
-        let net_a = Arc::new(P2pNetwork::new(id_a, "127.0.0.1:0".parse().unwrap(), store_a));
+        let net_a = Arc::new(P2pNetwork::new(NodeId([0x61u8; 32]), "127.0.0.1:0".parse().unwrap(), store_a));
+        let id_a = net_a.our_id();
         let net_a_clone = Arc::clone(&net_a);
         let server_a = tokio::spawn(async move { net_a_clone.run().await });
 
         // Daemon B
         let dir_b = tempdir().unwrap();
         let store_b = Arc::new(ChunkStore::open(dir_b.path().join("store.redb")).unwrap());
-        let id_b = NodeId([0x62u8; 32]);
         // B's committee: the test signer is the sole auditor, threshold 1.
         let signer_b = nexxus_core::keys::identity::Identity::generate();
         let net_b = Arc::new(P2pNetwork::with_auditors(
-            id_b,
+            NodeId([0x62u8; 32]),
             "127.0.0.1:0".parse().unwrap(),
             store_b,
             vec![signer_b.verifying_key],
             1,
         ));
+        let id_b = net_b.our_id();
         let net_b_clone = Arc::clone(&net_b);
         let server_b = tokio::spawn(async move { net_b_clone.run().await });
 

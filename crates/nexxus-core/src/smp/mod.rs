@@ -16,13 +16,17 @@ struct PendingEnvelope {
     expires_at: Instant,
 }
 
-/// XOR distance between two NodeIds (closer = smaller).
-fn xor_distance(a: &NodeId, b: &NodeId) -> u128 {
-    let mut d = 0u128;
-    for i in 0..32 {
-        d = (d << 8) | (a.0[i] as u128 ^ b.0[i] as u128);
+pub const MAX_PENDING_PER_RECIPIENT: usize = 256;
+pub const MAX_TOTAL_PENDING_ENVELOPES: usize = 10_000;
+
+/// Full 256-bit XOR distance between two NodeIds (M-20 fix: preserves all 32 bytes).
+/// [u8; 32] implements lexicographical ordering (most significant byte first).
+fn xor_distance(a: &NodeId, b: &NodeId) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = a.0[i] ^ b.0[i];
     }
-    d
+    out
 }
 
 /// SMP relay table: maps recipient node_id -> pending envelopes.
@@ -52,17 +56,38 @@ impl SmpRelay {
     }
 
     /// Store an envelope for later delivery to `recipient_node_id`.
-    /// Returns error if the envelope is too large.
+    /// Returns error if the envelope is too large or if total pending limits are exceeded (M-20).
     pub fn store_envelope(&mut self, env: SmpEnvelope) -> Result<(), NexxusError> {
         if env.ciphertext.len() > (1 << 20) {
             return Err(NexxusError::Io("smp envelope too large".into()));
         }
+
+        // Enforce total pending limit
+        if self.pending_count() >= MAX_TOTAL_PENDING_ENVELOPES {
+            self.gc();
+            if self.pending_count() >= MAX_TOTAL_PENDING_ENVELOPES {
+                return Err(NexxusError::Io("smp relay total pending capacity exceeded".into()));
+            }
+        }
+
         let recipient = NodeId(env.recipient_node_id);
+        let list = self.pending.entry(recipient).or_default();
+
+        // Enforce per-recipient limit
+        if list.len() >= MAX_PENDING_PER_RECIPIENT {
+            let now = Instant::now();
+            list.retain(|p| p.expires_at > now);
+            if list.len() >= MAX_PENDING_PER_RECIPIENT {
+                // Drop oldest
+                list.remove(0);
+            }
+        }
+
         let pending = PendingEnvelope {
             env,
             expires_at: Instant::now() + self.ttl,
         };
-        self.pending.entry(recipient).or_default().push(pending);
+        list.push(pending);
         Ok(())
     }
 
@@ -81,15 +106,15 @@ impl SmpRelay {
         result
     }
 
-    /// Return the `count` closest known peers to `target` (Kademlia lookup).
+    /// Return the `count` closest known peers to `target` (full 256-bit Kademlia lookup).
     pub fn closest_peers(&self, target: &NodeId, count: usize) -> Vec<NodeId> {
-        let mut peers: Vec<(NodeId, u128)> = self
+        let mut peers: Vec<(NodeId, [u8; 32])> = self
             .peers
             .keys()
             .filter(|pid| **pid != *target)
             .map(|pid| (*pid, xor_distance(pid, target)))
             .collect();
-        peers.sort_by_key(|(_, d)| *d);
+        peers.sort_by_key(|a| a.1);
         peers.into_iter().take(count).map(|(pid, _)| pid).collect()
     }
 
@@ -301,6 +326,23 @@ mod tests {
         assert_eq!(closest.len(), 2);
         assert_eq!(closest[0], NodeId([0x01u8; 32]));
         assert_eq!(closest[1], NodeId([0x80u8; 32]));
+    }
+
+    #[test]
+    fn xor_distance_checks_upper_16_bytes_first() {
+        let mut relay = SmpRelay::new(Duration::from_secs(60));
+        let target = NodeId([0x00u8; 32]);
+        // peer_a has difference in byte 0 (most significant byte): far
+        let mut a = [0x00u8; 32];
+        a[0] = 0x80;
+        // peer_b has difference in byte 31 (least significant byte): very close
+        let mut b = [0x00u8; 32];
+        b[31] = 0x80;
+        relay.register_peer(NodeId(a));
+        relay.register_peer(NodeId(b));
+        let closest = relay.closest_peers(&target, 2);
+        assert_eq!(closest[0], NodeId(b), "M-20: peer differing in byte 31 must be closer than peer differing in byte 0");
+        assert_eq!(closest[1], NodeId(a));
     }
 
     #[test]

@@ -14,6 +14,8 @@ pub const IOU_KIND: &str = "nexxus-iou/v1";
 pub const DEFAULT_IOU_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 /// Minimum amount to fight spam-griefing (ADR-0009 §5): 0.001 NEXX.
 pub const MIN_IOU_MICRO: i64 = 1_000_000;
+/// M-19: upper bound on a single IOU (1000 NEXX) — anti-whale/griefing cap.
+pub const MAX_IOU_MICRO: i64 = 1_000_000_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Iou {
@@ -80,6 +82,9 @@ impl Iou {
     ) -> Result<Self, IouError> {
         if amount.0 < MIN_IOU_MICRO {
             return Err(IouError::BelowMinimum(amount.0));
+        }
+        if amount.0 > MAX_IOU_MICRO {
+            return Err(IouError::Overflow);
         }
         let mut iou = Iou {
             debtor: debtor.node_id(),
@@ -175,6 +180,9 @@ impl Iou {
         if self.amount_micro < MIN_IOU_MICRO {
             return Err(IouError::BelowMinimum(self.amount_micro));
         }
+        if self.amount_micro > MAX_IOU_MICRO {
+            return Err(IouError::Overflow);
+        }
         if now_unix > self.expiry_unix {
             return Err(IouError::Expired { now: now_unix, expiry_unix: self.expiry_unix });
         }
@@ -231,6 +239,15 @@ mod tests {
         let iou = Iou::new(&debtor, creditor_id.node_id(), Money(2_000_000), 1, [1u8; 32], 100).unwrap();
         let vk = debtor.verifying_key.to_bytes();
         assert!(matches!(iou.verify(&vk, 100 + DEFAULT_IOU_TTL_SECS + 1), Err(IouError::Expired { .. })));
+    }
+
+    #[test]
+    fn above_maximum_rejected() {
+        let (debtor, creditor_id) = pair();
+        assert!(matches!(
+            Iou::new(&debtor, creditor_id.node_id(), Money(MAX_IOU_MICRO + 1), 1, [1u8; 32], 100),
+            Err(IouError::Overflow)
+        ));
     }
 
     #[test]

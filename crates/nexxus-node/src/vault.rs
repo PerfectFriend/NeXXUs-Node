@@ -150,12 +150,14 @@ pub async fn download_file(
             })
             .collect();
         let mut shards: Vec<(Vec<u8>, usize)> = Vec::with_capacity(rs::DATA_SHARDS);
+        // H-10: Iterate through all shards (data + parity) and collect up to DATA_SHARDS.
+        // If an individual shard is unavailable, continue and try subsequent (parity) shards.
         for (s, h) in shard_hashes.iter().enumerate() {
             if shards.len() >= rs::DATA_SHARDS {
                 break;
             }
             let shard_raw = match store.get_chunk(h)? {
-                Some(d) => d,
+                Some(d) => Some(d),
                 None => {
                     let mut got = None;
                     for p in &peers {
@@ -164,14 +166,19 @@ pub async fn download_file(
                             break;
                         }
                     }
-                    got.ok_or_else(|| {
-                        NexxusError::Io(format!(
-                            "shard {s} of chunk {index} unavailable locally and on all peers"
-                        ))
-                    })?
+                    got
                 }
             };
-            shards.push((shard_raw, s));
+            if let Some(shard_data) = shard_raw {
+                shards.push((shard_data, s));
+            }
+        }
+        if shards.len() < rs::DATA_SHARDS {
+            return Err(NexxusError::Io(format!(
+                "insufficient shards for chunk {index}: collected {} of {} required (RS 4+2 quorum failed)",
+                shards.len(),
+                rs::DATA_SHARDS
+            )));
         }
         let refs: Vec<(&[u8], usize)> = shards.iter().map(|(d, i)| (d.as_slice(), *i)).collect();
         let sealed = rs::decode(&refs, sealed_len)?;
@@ -464,6 +471,38 @@ mod tests {
         server_a.abort();
         server_b.abort();
         server_c.abort();
+    }
+
+    #[tokio::test]
+    async fn download_file_recovers_via_parity_when_shards_missing() {
+        // H-10: If primary data shard 0 is missing, download_file must continue
+        // and reconstruct the original data using parity shards (Reed-Solomon 4+2).
+        let (net, _addr, server) = spawn(0x77).await;
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("parity_test.bin");
+        let data: Vec<u8> = (0..16_000u32).map(|i| ((i * 17 + 3) % 256) as u8).collect();
+        std::fs::write(&file, &data).unwrap();
+
+        let up = upload_file(&net, net.store(), &file).await.unwrap();
+        let root = up["root"].as_str().unwrap().to_string();
+
+        let key = format!("manifest_{root}");
+        let raw_manifest = net.store().get_meta(&key).unwrap().unwrap();
+        let manifest: Value = serde_json::from_slice(&raw_manifest).unwrap();
+        let shard0_hex = manifest["chunks"][0]["shard_hashes"][0].as_str().unwrap();
+        let shard0_hash = ChunkHash(<[u8; 32]>::try_from(hex::decode(shard0_hex).unwrap()).unwrap());
+
+        // Delete primary shard 0 from store
+        net.store().delete_chunk(&shard0_hash).unwrap();
+        assert!(net.store().get_chunk(&shard0_hash).unwrap().is_none(), "shard 0 deleted");
+
+        // Download must still succeed via parity shards!
+        let out = dir.path().join("recovered_via_parity.bin");
+        let dl = download_file(&net, net.store(), &root, &out).await.unwrap();
+        assert_eq!(dl["bytes"].as_u64().unwrap() as usize, data.len());
+        assert_eq!(std::fs::read(&out).unwrap(), data, "H-10: bit-identical reconstruction despite missing data shard");
+
+        server.abort();
     }
 
     #[test]

@@ -139,15 +139,15 @@ impl RoutingTable {
             .any(|b| b.iter().any(|p| &p.node_id == id))
     }
 
-    /// `count` closest peers to `target`, ordered by XOR distance (closest first).
+    /// `count` closest peers to `target`, ordered by full 256-bit XOR distance (closest first, M-20 fix).
     pub fn find_node(&self, target: &NodeId, count: usize) -> Vec<Peer> {
-        let mut scored: Vec<(u128, Peer)> = self
+        let mut scored: Vec<([u8; 32], Peer)> = self
             .buckets
             .iter()
             .flat_map(|b| b.iter().cloned())
             .map(|p| (xor_distance(&p.node_id, target), p))
             .collect();
-        scored.sort_by_key(|(d, _)| *d);
+        scored.sort_by_key(|a| a.0);
         scored
             .into_iter()
             .take(count)
@@ -178,13 +178,13 @@ impl RoutingTable {
     }
 }
 
-/// XOR distance folded to u128 for ordering (full 256-bit XOR, consistent with smp/mod.rs).
-fn xor_distance(a: &NodeId, b: &NodeId) -> u128 {
-    let mut acc: u128 = 0;
-    for i in 0..32 {
-        acc = (acc << 8) | (a.0[i] ^ b.0[i]) as u128;
+/// Full 256-bit XOR distance between two NodeIds (M-20 fix: preserves all 32 bytes).
+fn xor_distance(a: &NodeId, b: &NodeId) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (o, (x, y)) in out.iter_mut().zip(a.0.iter().zip(b.0.iter())) {
+        *o = x ^ y;
     }
-    acc
+    out
 }
 
 #[cfg(test)]
