@@ -48,6 +48,7 @@ DEFAULT_DATA_DIR="/var/lib/nexxus"
 DEFAULT_REPO="PerfectFriend/NeXXus-Node"
 PEERS_LIST=""
 FROM_SOURCE=false
+NEXXUS_VERSION=""   # H-25: pin release tag, e.g. --version=v0.229.0
 
 for arg in "$@"; do
   case $arg in
@@ -75,6 +76,10 @@ for arg in "$@"; do
       FROM_SOURCE=true
       shift
       ;;
+    --version=*)
+      NEXXUS_VERSION="${arg#*=}"
+      shift
+      ;;
   esac
 done
 
@@ -96,7 +101,7 @@ echo -e "🧠 Physical RAM:     ${TOTAL_MEM_GB} GB"
 # 4. Determine Project Directory (Cloned vs Direct Curl Execution)
 INSTALL_DIR="/opt/nexxus"
 
-if [ -f "scripts/linux-daemon.ts" ] && [ -f "package.json" ]; then
+if [ -f "Cargo.toml" ] && [ -d "crates" ]; then
   # We are inside the cloned repository!
   REPO_DIR="$(pwd)"
   echo -e "📁 Installing directly from local repository: ${BOLD}${REPO_DIR}${NC}"
@@ -115,8 +120,13 @@ else
   if [ -d "$INSTALL_DIR/.git" ]; then
     echo -e "🔄 Existing git repository detected at ${INSTALL_DIR}. Updating to latest..."
     cd "$INSTALL_DIR"
-    $SUDO git fetch --all >/dev/null 2>&1 || true
-    $SUDO git reset --hard origin/main >/dev/null 2>&1 || $SUDO git pull >/dev/null 2>&1 || true
+    $SUDO git fetch --all --tags >/dev/null 2>&1 || true
+    if [ -n "$NEXXUS_VERSION" ]; then
+      # H-25: пин на конкретный релизный тег вместо скользящего main
+      $SUDO git checkout -q "tags/${NEXXUS_VERSION}" || { echo -e "${RED}❌ Unknown version tag: ${NEXXUS_VERSION}${NC}"; exit 1; }
+    else
+      $SUDO git reset --hard origin/main >/dev/null 2>&1 || $SUDO git pull >/dev/null 2>&1 || true
+    fi
   else
     echo -e "📥 Cloning repository from GitHub: https://github.com/${DEFAULT_REPO}.git ..."
     $SUDO git clone "https://github.com/${DEFAULT_REPO}.git" "$INSTALL_DIR" || {
@@ -128,42 +138,58 @@ else
   cd "$REPO_DIR"
 fi
 
-# 5. Check or Install Node.js LTS (>= v20)
-NODE_VER=""
-if command -v node >/dev/null 2>&1; then
-  NODE_VER=$(node -v | sed 's/v//')
-  NODE_MAJOR=$(echo "$NODE_VER" | cut -d. -f1)
-fi
-
-if [ -z "$NODE_VER" ] || [ "${NODE_MAJOR:-0}" -lt 20 ]; then
-  echo -e "📦 Installing Node.js LTS (v20.x) via official NodeSource repository..."
-  $SUDO apt-get update -y >/dev/null 2>&1
-  $SUDO apt-get install -y ca-certificates curl gnupg >/dev/null 2>&1
-  $SUDO mkdir -p /etc/apt/keyrings
-  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | $SUDO gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg --yes >/dev/null 2>&1
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | $SUDO tee /etc/apt/sources.list.d/nodesource.list >/dev/null 2>&1
-  $SUDO apt-get update -y >/dev/null 2>&1
-  $SUDO apt-get install -y nodejs >/dev/null 2>&1
-  echo -e "✅ Node.js installed: ${GREEN}$(node -v)${NC}"
+# 5. Check or Install Rust Toolchain (>= 1.80)
+if ! command -v cargo >/dev/null 2>&1; then
+  echo -e "📦 Installing Rust toolchain via official rustup..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+  source "$HOME/.cargo/env"
+  echo -e "✅ Rust toolchain installed: ${GREEN}$(rustc --version)${NC}"
 else
-  echo -e "✅ Node.js detected: ${GREEN}v${NODE_VER}${NC}"
+  echo -e "✅ Rust toolchain detected: ${GREEN}$(rustc --version)${NC}"
 fi
 
-# 6. Build and Install Binary
+# 6. Build and Install Native Rust Binary
 cd "$REPO_DIR"
 
 mkdir -p "$REPO_DIR/dist"
-echo -e "⚡ Compiling standalone NeXXUs daemon bundle..."
-if command -v npx >/dev/null 2>&1; then
-  npx esbuild scripts/linux-daemon.ts --bundle --platform=node --format=cjs --outfile=dist/nexxusd.cjs
+if [ -n "$NEXXUS_VERSION" ] && [ "$ARCH" = "x86_64" ]; then
+  # H-25: предпочитаем подписанный prebuilt-артефакт релиза (minisign + SHA256SUMS)
+  REL_URL="https://github.com/${DEFAULT_REPO}/releases/download/${NEXXUS_VERSION}"
+  TMPD=$(mktemp -d)
+  if curl -fsSL "$REL_URL/SHA256SUMS" -o "$TMPD/SHA256SUMS" && curl -fsSL "$REL_URL/SHA256SUMS.minisig" -o "$TMPD/SHA256SUMS.minisig" && curl -fsSL "$REL_URL/nexxusd" -o "$TMPD/nexxusd"; then
+    if command -v minisign >/dev/null 2>&1; then
+      MINISIGN_PASSWORD='' minisign -V -q -p "$REPO_DIR/keys/nexxus-release-minisign.pub" -m "$TMPD/SHA256SUMS" -x "$TMPD/SHA256SUMS.minisig" || { echo -e "${RED}❌ Release signature INVALID — aborting${NC}"; rm -rf "$TMPD"; exit 1; }
+    else
+      echo -e "${YELLOW}⚠️  minisign not installed — installing for release verification${NC}"
+      $SUDO apt-get update -qq >/dev/null 2>&1; $SUDO apt-get install -y -qq minisign >/dev/null 2>&1
+      MINISIGN_PASSWORD='' minisign -V -q -p "$REPO_DIR/keys/nexxus-release-minisign.pub" -m "$TMPD/SHA256SUMS" -x "$TMPD/SHA256SUMS.minisig" || { echo -e "${RED}❌ Release signature INVALID — aborting${NC}"; rm -rf "$TMPD"; exit 1; }
+    fi
+    (cd "$TMPD" && grep -E '(^|[ /])nexxusd$' SHA256SUMS | sha256sum -c -) || { echo -e "${RED}❌ nexxusd checksum mismatch — aborting${NC}"; rm -rf "$TMPD"; exit 1; }
+    cp "$TMPD/nexxusd" "$REPO_DIR/dist/nexxusd"
+    chmod 755 "$REPO_DIR/dist/nexxusd"
+    rm -rf "$TMPD"
+    echo -e "✅ Verified signed release binary ${GREEN}${NEXXUS_VERSION}${NC}"
+  else
+    echo -e "${YELLOW}⚠️  No prebuilt release assets for ${NEXXUS_VERSION} — falling back to source build${NC}"
+    cargo build --release -p nexxus-node
+    BIN_PATH="${CARGO_TARGET_DIR:-target}/release/nexxusd"
+    [ -f "$BIN_PATH" ] || BIN_PATH="target/release/nexxusd"
+    cp "$BIN_PATH" "$REPO_DIR/dist/nexxusd"
+    chmod 755 "$REPO_DIR/dist/nexxusd"
+  fi
 else
-  $SUDO npm install -g esbuild >/dev/null 2>&1
-  esbuild scripts/linux-daemon.ts --bundle --platform=node --format=cjs --outfile=dist/nexxusd.cjs
+  echo -e "⚡ Compiling native Rust NeXXuS daemon binary (nexxusd)..."
+  cargo build --release -p nexxus-node
+  BIN_PATH="${CARGO_TARGET_DIR:-target}/release/nexxusd"
+  if [ ! -f "$BIN_PATH" ]; then
+    BIN_PATH="target/release/nexxusd"
+  fi
+  cp "$BIN_PATH" "$REPO_DIR/dist/nexxusd"
+  chmod 755 "$REPO_DIR/dist/nexxusd"
 fi
-chmod +x "$REPO_DIR/dist/nexxusd.cjs"
 
 # Install global CLI binary
-$SUDO cp "$REPO_DIR/dist/nexxusd.cjs" /usr/local/bin/nexxusd
+$SUDO cp "$REPO_DIR/dist/nexxusd" /usr/local/bin/nexxusd
 $SUDO chmod 755 /usr/local/bin/nexxusd
 
 # Also check for .deb package build
@@ -226,7 +252,16 @@ net.ipv4.tcp_fin_timeout = 15
 EOF
 $SUDO sysctl --system >/dev/null 2>&1 || true
 
-# 9. Systemd Service Setup
+# 9. System User & Systemd Service Setup
+if ! getent group nexxus >/dev/null 2>&1; then
+  $SUDO groupadd --system nexxus
+fi
+if ! getent passwd nexxus >/dev/null 2>&1; then
+  $SUDO useradd --system --home-dir "${DEFAULT_DATA_DIR}" --shell /bin/false --gid nexxus nexxus
+fi
+$SUDO mkdir -p "${DEFAULT_DATA_DIR}"
+$SUDO chown -R nexxus:nexxus "${DEFAULT_DATA_DIR}"
+
 echo -e "⚙️  Installing systemd daemon service: ${BOLD}/etc/systemd/system/nexxus-node.service${NC}..."
 $SUDO tee /etc/systemd/system/nexxus-node.service > /dev/null <<EOF
 [Unit]
@@ -237,9 +272,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=nexxus
+Group=nexxus
 EnvironmentFile=-/etc/nexxus/nexxus.conf
-Environment=NODE_ENV=production
 Environment=NEXXUS_DATA_DIR=${DEFAULT_DATA_DIR}
 Environment=NEXXUS_STORAGE_GB=${DEFAULT_STORAGE_GB}
 Environment=NEXXUS_PORT=${DEFAULT_PORT}
@@ -253,6 +288,7 @@ SyslogIdentifier=nexxusd
 
 # Linux Security Sandbox
 ProtectSystem=full
+ProtectHome=read-only
 PrivateTmp=true
 NoNewPrivileges=true
 
