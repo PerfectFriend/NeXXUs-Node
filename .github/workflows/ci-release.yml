@@ -34,11 +34,13 @@ jobs:
       - name: 🧪 Run Protocol & Golden Vector Test Suites (113 checks)
         run: npm test
 
-      - name: ⚡ Compile Standalone Daemon Bundle (esbuild)
+      - name: ⚡ Build Native Rust Daemon (nexxusd)
         run: |
           mkdir -p dist
-          npx esbuild scripts/linux-daemon.ts --bundle --platform=node --format=cjs --outfile=dist/nexxusd.cjs
-          ls -lh dist/nexxusd.cjs
+          cargo build --release -p nexxus-node
+          cp target/release/nexxusd dist/nexxusd
+          chmod +x dist/nexxusd
+          ls -lh dist/nexxusd
 
       - name: 📦 Build Debian / Ubuntu amd64 Package (.deb)
         run: |
@@ -50,7 +52,7 @@ jobs:
         with:
           name: nexxus-dist
           path: |
-            dist/nexxusd.cjs
+            dist/nexxusd
             dist/*.deb
 
   rust:
@@ -377,11 +379,28 @@ jobs:
           mkdir -p dist/windows
           cp scripts/windows/install-service.ps1 scripts/windows/uninstall-service.ps1 scripts/windows/nexxus-service.xml dist/windows/
 
+      - name: '🔏 H-12: SHA256SUMS + minisign signature of release assets'
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ''
+        run: |
+          set -e
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          echo "$MINISIGN_SECRET_KEY" | base64 -d > /tmp/nexxus-release.key
+          chmod 600 /tmp/nexxus-release.key
+          cd dist
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -exec sha256sum {} + > SHA256SUMS
+          minisign -S -s /tmp/nexxus-release.key -m SHA256SUMS -x SHA256SUMS.minisig
+          minisign -V -p ../keys/nexxus-release-minisign.pub -m SHA256SUMS -x SHA256SUMS.minisig
+          cd ..
+          cp dist/SHA256SUMS dist/SHA256SUMS.minisig .
+
       - name: 🚀 Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/nexxusd.cjs
+            SHA256SUMS
+            SHA256SUMS.minisig
             dist/nexxusd
             dist/nexxus-desktop
             dist/*.deb

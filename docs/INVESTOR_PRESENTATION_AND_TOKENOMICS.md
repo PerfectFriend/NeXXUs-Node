@@ -15,10 +15,10 @@
 3. **Угроза квантового взлома («Harvest Now, Decrypt Later»)**: Государственные спецслужбы и злоумышленники уже перехватывают зашифрованный трафик с целью его последующей расшифровки на квантовых суперкомпьютерах через 3–5 лет.
 
 ### Решение NeXXuS:
-- **Zero-Knowledge Storage**: Нарезка на 16 KiB чанки, избыточное кодирование Рида-Соломона **RS(4+2)**, шифрование каждого файла на клиенте **XChaCha20-Poly1305**. Ни один чужой узел не может прочитать данные.
-- **Tor Onion v3 Native**: Абсолютная анонимность узлов, отсутствие открытых IP-адресов, обход любых мобильных CGNAT и фаерволов без настройки портов.
-- **Post-Quantum Hybrid Shield**: Первый в мире P2P-протокол с гибридным обменом ключами $X25519 \oplus ML\text{-}KEM\text{-}768$ (стандарт NIST FIPS 203 / Kyber). Данные защищены от будущих квантовых компьютеров.
-- **Succinct ZK-SNARK PoR**: Мгновенная верификация хранения терабайтов данных через 384-байтные ZK-доказательства без скачивания файлов.
+- **Zero-Knowledge Storage**: Нарезка на 16 KiB чанки, избыточное кодирование Рида-Соломона **RS(4+2)**, шифрование каждого файла на клиенте **ChaCha20-Poly1305 / AES-256-GCM**. Ни один чужой узел не может прочитать данные.
+- **Tor Onion v3 Native**: Анонимность узлов, скрытые сервисы, обход мобильных CGNAT и фаерволов без настройки портов.
+- **Proof-of-Retrievability (PoR)**: Высокоскоростная верификация целостности хранения данных через криптографические Merkle-доказательства без передачи файлов по сети (с запланированным переходом на Succinct ZK-SNARK в Phase 3).
+- **Post-Quantum Hybrid Roadmap**: Архитектурная поддержка перехода на гибридный обмен ключами $X25519 \oplus ML\text{-}KEM\text{-}768$ (стандарт NIST FIPS 203 / Kyber) для долгосрочной защиты от квантовой угрозы SNDL.
 
 ---
 
@@ -26,24 +26,24 @@
 
 ```mermaid
 graph TD
-    User["Пользователь / Enterprise"] -->|AES-256 / XChaCha20| ClientEngine["Client Slicing Engine (16 KiB)"]
+    User["Пользователь / Enterprise"] -->|AES-256-GCM / ChaCha20| ClientEngine["Client Slicing Engine (16 KiB)"]
     ClientEngine -->|Reed-Solomon RS 4+2| Shards["6 Шардов (4 Data + 2 Parity)"]
-    Shards -->|Post-Quantum Hybrid ML-KEM-768| TorP2P["Tor Onion v3 Swarm Routing"]
+    Shards -->|Encrypted Tor Mesh| TorP2P["Tor Onion v3 Swarm Routing"]
     TorP2P --> NodeA["Node 1 (Home Mini-PC)"]
     TorP2P --> NodeB["Node 2 (Android 24/7)"]
     TorP2P --> NodeC["Node 3 (Enterprise Server)"]
     TorP2P --> NodeD["Node 4 (Storage Provider)"]
-    NodeA -.->|384B ZK-SNARK Proof| Auditor["Auditor Council / TON Smart Contracts"]
+    NodeA -.->|Merkle PoR Proof| Auditor["Auditor Council / TON Smart Contracts"]
 ```
 
 | Параметр | AWS S3 / Google Drive | Filecoin / Arweave | NeXXuS Sovereign Protocol |
 |---|:---:|:---:|:---:|
 | **Приватность** | Нулевая (Big Tech сканирует данные) | Публичные транзакции, IP видны | **100% Zero-Knowledge + Tor Onion v3** |
-| **Квантовая стойкость** | Отсутствует (классический RSA/ECC) | Отсутствует | **ML-KEM-768 (Kyber) Hybrid Shield** |
+| **Квантовая защита** | Отсутствует (классический RSA/ECC) | Отсутствует | **Roadmap Phase 3: ML-KEM-768 Hybrid** |
 | **Запуск ноды** | Недоступно | Дорогое серверное железо, GPU | **Любой ноутбук, Mini-PC или Android-телефон** |
-| **Проверка хранения (PoR)** | Доверие корпорации | Медленные тяжелые PoSt (минуты) | **Succinct ZK-SNARK (< 5 миллисекунд)** |
+| **Проверка хранения (PoR)** | Доверие корпорации | Медленные тяжелые PoSt (минуты) | **Merkle PoR (< 5 мс, ZK-SNARK в Roadmap)** |
 | **Связность за NAT** | Централизованный сервер | Требует белый IP / UPnP | **Tor Onion Rendezvous (100% пробиваемость)** |
-| **Готовность ядра** | Legacy проприетарное ПО | Сложные тяжелые клиенты | **100% Safe Rust Core (431 тест GREEN)** |
+| **Готовность ядра** | Legacy проприетарное ПО | Сложные тяжелые клиенты | **Safe Rust Core (245 тестов GREEN, Redb ACID)** |
 
 ---
 
@@ -158,7 +158,7 @@ pie title Структура прогнозируемой выручки (Year 3
 ```mermaid
 flowchart LR
     Step1["1. Telegram & TON Distribution<br>(Вирусный онбординг)"] --> Step2["2. Plug & Play Hardware<br>(Коробочные Home Box)"]
-    Step2 --> Step3["3. Post-Quantum PR & Certification<br>(FIPS 203 лидерство)"]
+    Step2 --> Step3["3. Post-Quantum Roadmap & Certification<br>(ML-KEM-768 интеграция — Phase 3, без претензий на лидерство до аудита)"]
     Step3 --> Step4["4. Developer SDK Fund<br>(dApp экосистема)"]
     Step4 --> Step5["5. Institutional Enterprise Sales<br>(Крупные B2B контракты)"]
 ```
@@ -172,8 +172,8 @@ flowchart LR
 - Заключение OEM-контрактов с производителями аппаратного обеспечения в Шэньчжэне на сборку брендовых коробок NeXXuS.
 - Продажа устройств через Amazon, специализированные маркетплейсы и крипто-сообщества как «бесплатное облако на всю жизнь без абонентской платы».
 
-### 3. Маркетинговое позиционирование: «Первый в мире квантово-стойкий сейф»
-- Активная PR-кампания в профильных мировых медиа (CoinDesk, Cointelegraph, TechCrunch, Hacker News) вокруг реализации NIST FIPS 203 ML-KEM-768.
+### 3. Маркетинговое позиционирование: «Суверенный Zero-Knowledge сейф с квантово-стойким роадмапом»
+- Активная PR-кампания в профильных медиа (CoinDesk, Cointelegraph, TechCrunch, Hacker News) вокруг открытого суверенного Rust-ядра; упоминание NIST FIPS 203 ML-KEM — только как roadmap Phase 3 (реализация и внешний аудит ещё впереди).
 - Проведение открытого аудита криптографии от ведущих мировых аудиторских фирм (Trail of Bits, OpenZeppelin, Kudelski).
 
 ### 4. Фонд грантов для разработчиков NeXXuS SDK (\$1.5M)
