@@ -468,9 +468,11 @@ fn main() {
         // Wire v4 listener (ADR-0011): NEXXUS_P2P_V4_PORT>0 включает отдельный порт с Noise-handshake.
         #[cfg(feature = "wire-v4")]
         {
-            let v4port: u16 = crate::node_config::cfg_or_env(&conf, "p2p_v4_port", "NEXXUS_P2P_V4_PORT", "0")
+            // P1-5: v4 включён по умолчанию на порту 4002 (mixed-mode с v3 на основном порту);
+            // NEXXUS_P2P_V4_PORT=0 или p2p_v4_port=0 в node.conf отключает.
+            let v4port: u16 = crate::node_config::cfg_or_env(&conf, "p2p_v4_port", "NEXXUS_P2P_V4_PORT", "4002")
                 .parse()
-                .unwrap_or(0);
+                .unwrap_or(4002);
             if v4port > 0 {
                 let v4_addr = SocketAddr::new(listen_addr.ip(), v4port);
                 let net_v4 = Arc::clone(&net);
