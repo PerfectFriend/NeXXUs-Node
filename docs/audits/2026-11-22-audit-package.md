@@ -1,4 +1,4 @@
-# Пакет для следующего внешнего аудита — 2026-11-22 (HEAD `cfad2ab`)
+# Пакет для следующего внешнего аудита — 2026-11-22 (HEAD `2711232`)
 
 ## Что закрыто с момента аудита v0.229.0-rc3
 
@@ -31,7 +31,7 @@ ADR-0011 (`docs/adr/0011-wire-v4.md`) — дизайн wire v4, вопросы �
 
 ## Известные ограничения (честно, для аудитора)
 
-1. wire v4 — primitives в `nexxus-core` за флагом, **интеграция в P2P loop (network.rs) — следующий этап**; v3 остаётся default до deprecation window.
+1. wire v4 — интегрирован за флагом `wire-v4` (`2711232`): v4-listener на `NEXXUS_P2P_V4_PORT` с Noise_XX handshake, `NoiseStream` (AsyncRead/Write поверх Noise transport) — поверх него работает обычный frame loop; `dial_v4_ping` + e2e `v4_noise_ping_over_v4_port` ок. v3 остаётся default; mixed-mode/auto-upgrade — следующий этап.
 2. Panic cooldown хранится в `panic.state` рядом со стором — удаление файла сбрасывает кулдаун (без TPM не лечится).
 3. sync: `std::fs` в async-путях, пустые файлы пропускаются, версий не хранится (один индекс на файл).
 4. TON-контракты — прототипы, on-chain деплоя нет.
