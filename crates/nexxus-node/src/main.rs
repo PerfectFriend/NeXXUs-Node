@@ -40,7 +40,6 @@ mod sync;
 use crate::net::P2pNetwork;
 use crate::storage::ChunkStore;
 use crate::local_api::LocalApi;
-use crate::identity_store::load_or_create_identity;
 
 /// E0: момент старта процесса — для метрики `uptime_secs` в node_metrics.
 pub static START_TIME: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -233,7 +232,10 @@ fn main() {
         // Mnemonic печатается ровно один раз — при первом создании.
         // S4/ADR-0010: PIN для seed vault — из env или systemd-credential.
         let seed_pin = vault_pin_from_env_or_credential();
-        let (node_iden, fresh_mnemonic) = load_or_create_identity(&store, seed_pin.as_ref().map(|z| z.as_str())).unwrap_or_else(|e| {
+        // P0-2: --insecure-plaintext-seed / NEXXUS_INSECURE_PLAINTEXT_SEED=1 — только для dev
+        let allow_plaintext = std::env::var("NEXXUS_INSECURE_PLAINTEXT_SEED").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+            || std::env::args().any(|a| a == "--insecure-plaintext-seed");
+        let (node_iden, fresh_mnemonic) = crate::identity_store::load_or_create_identity_ex(&store, seed_pin.as_ref().map(|z| z.as_str()), allow_plaintext).unwrap_or_else(|e| {
             eprintln!("nexxusd: identity load failed: {e}");
             process::exit(1);
         });

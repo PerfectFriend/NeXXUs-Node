@@ -375,7 +375,6 @@ pub fn doctor(store: &ChunkStore) -> DoctorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity_store::load_or_create_identity;
     use nexxus_core::types::ChunkHash;
     use sha2::Digest;
     use tempfile::tempdir;
@@ -388,7 +387,7 @@ mod tests {
     fn store_with_data() -> (tempfile::TempDir, ChunkStore) {
         let dir = tempdir().unwrap();
         let store = ChunkStore::open(dir.path().join("store.redb")).unwrap();
-        let _ = load_or_create_identity(&store, None).unwrap();
+        let _ = crate::identity_store::load_or_create_identity_ex(&store, None, true).unwrap();
         store.put_chunk(&h(b"hello"), b"hello").unwrap();
         store.put_chunk(&h(b"world"), b"world").unwrap();
         (dir, store)
@@ -488,7 +487,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("store.redb");
         let store = ChunkStore::open(&path).unwrap();
-        let _ = load_or_create_identity(&store, None).unwrap();
+        let _ = crate::identity_store::load_or_create_identity_ex(&store, None, true).unwrap();
         store.put_chunk(&h(b"v1"), b"v1").unwrap();
         drop(store);
         let m = backup_store(&ChunkStore::open(&path).unwrap()).unwrap();

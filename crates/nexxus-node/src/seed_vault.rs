@@ -65,15 +65,32 @@ pub fn write_vault_from_phrase(
     }
     let path = seed_vault_path(store);
     let tmp = path.with_extension("vault.tmp");
-    std::fs::write(&tmp, vault_json.as_bytes())
-        .map_err(|e| NexxusError::Io(format!("write vault tmp: {e}")))?;
+    // P1-8 (аудит 2026-11-23): временный файл создаётся СРАЗУ с mode 0600
+    // (create_new — нет окна гонки по umask), fsync файла и каталога до/после rename.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| NexxusError::Io(format!("chmod vault: {e}")))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| NexxusError::Io(format!("create vault tmp: {e}")))?;
+        use std::io::Write;
+        f.write_all(vault_json.as_bytes())
+            .and_then(|_| f.sync_all())
+            .map_err(|e| NexxusError::Io(format!("write vault tmp: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, vault_json.as_bytes())
+            .map_err(|e| NexxusError::Io(format!("write vault tmp: {e}")))?;
     }
     std::fs::rename(&tmp, &path).map_err(|e| NexxusError::Io(format!("rename vault: {e}")))?;
+    // fsync каталога, чтобы rename пережил сбой питания
+    if let Ok(d) = std::fs::File::open(path.parent().unwrap_or(std::path::Path::new("."))) {
+        let _ = d.sync_all();
+    }
     Ok(path)
 }
 
@@ -161,13 +178,22 @@ pub fn restore_seed(store: &ChunkStore, pin: &str) -> Result<RestoreOutcome, Nex
         if vault.duress_hash_hex.is_none() {
             let re = encrypt_vault_payload_rounds(phrase.as_bytes(), pin, None, PBKDF2_ROUNDS)?;
             let tmp = path.with_extension("vault.tmp");
-            std::fs::write(&tmp, re.as_bytes())
-                .map_err(|e| NexxusError::Io(format!("write re-encrypted vault tmp: {e}")))?;
+            // P1-8: create_new + mode 0600 сразу, fsync до rename
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                    .map_err(|e| NexxusError::Io(format!("chmod vault: {e}")))?;
+                use std::os::unix::fs::OpenOptionsExt;
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true).create_new(true).mode(0o600)
+                    .open(&tmp)
+                    .map_err(|e| NexxusError::Io(format!("create re-vault tmp: {e}")))?;
+                f.write_all(re.as_bytes()).and_then(|_| f.sync_all())
+                    .map_err(|e| NexxusError::Io(format!("write re-encrypted vault tmp: {e}")))?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&tmp, re.as_bytes())
+                    .map_err(|e| NexxusError::Io(format!("write re-encrypted vault tmp: {e}")))?;
             }
             std::fs::rename(&tmp, &path)
                 .map_err(|e| NexxusError::Io(format!("rename vault: {e}")))?;
@@ -192,15 +218,27 @@ pub fn restore_seed(store: &ChunkStore, pin: &str) -> Result<RestoreOutcome, Nex
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn vault_file_is_0600_and_no_tmp_left() {
+        // P1-8 регрессионный тест: vault пишется сразу с 0600, tmp не остаётся.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+        let path = write_vault_from_phrase(&store, b"legal winner thank year wave sausage worth useful legal winner thank yellow", "123456", None).unwrap();
+        let md = std::fs::metadata(&path).unwrap();
+        assert_eq!(md.permissions().mode() & 0o777, 0o600);
+        assert!(!path.with_extension("vault.tmp").exists());
+    }
+
     use super::*;
-    use crate::identity_store::load_or_create_identity;
     use tempfile::tempdir;
 
     fn store_with_identity() -> (tempfile::TempDir, ChunkStore) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("store.redb");
         let store = ChunkStore::open(&path).unwrap();
-        let _ = load_or_create_identity(&store, None).unwrap();
+        let _ = crate::identity_store::load_or_create_identity_ex(&store, None, true).unwrap();
         (dir, store)
     }
 
@@ -231,7 +269,7 @@ mod tests {
         backup_seed(&store, "1234", None).unwrap();
         match restore_seed(&store, "1234").unwrap() {
             RestoreOutcome::Already(id) => {
-                let (id2, _) = load_or_create_identity(&store, None).unwrap();
+                let (id2, _) = crate::identity_store::load_or_create_identity_ex(&store, None, true).unwrap();
                 assert_eq!(id, id2.node_id);
             }
             other => panic!("expected Already, got {other:?}"),
@@ -241,7 +279,7 @@ mod tests {
     #[test]
     fn restore_into_empty_store_imports_and_restores_node_id() {
         let (d1, store1) = store_with_identity();
-        let (id1, _) = load_or_create_identity(&store1, None).unwrap();
+        let (id1, _) = crate::identity_store::load_or_create_identity_ex(&store1, None, true).unwrap();
         backup_seed(&store1, "1234", None).unwrap();
         // Копируем vault рядом с новым (пустым) стором.
         let d2 = tempdir().unwrap();
@@ -255,7 +293,7 @@ mod tests {
             other => panic!("expected Imported, got {other:?}"),
         }
         // И load_or_create на новом сторе видит ту же идентичность.
-        let (id2, created) = load_or_create_identity(&store2, None).unwrap();
+        let (id2, created) = crate::identity_store::load_or_create_identity_ex(&store2, None, true).unwrap();
         assert!(created.is_none());
         assert_eq!(id2.node_id, id1.node_id);
     }

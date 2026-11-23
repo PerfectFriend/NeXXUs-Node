@@ -22,12 +22,43 @@ pub const COOLDOWN_CAP_SECS: u64 = 24 * 3600;
 #[derive(Serialize, Deserialize, Clone)]
 struct StateFile {
     salt_hex: String,
-    pin_hash_hex: String,
-    #[serde(default)]
+    /// P0-1 (аудит 2026-11-23): legacy SHA-256(PIN||salt) — оставлен только для
+    /// миграции старых файлов; новые arm() пишут только phc-поля.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pin_hash_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     duress_hash_hex: Option<String>,
+    /// P0-1: Argon2id PHC-строка (m=64 MiB, t=3) — медленный офлайн-перебор.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pin_phc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duress_phc: Option<String>,
     fail_count: u64,
     /// Unix-секунды до какого момента кулдаун; 0 = нет кулдауна.
     cooldown_until: u64,
+}
+
+/// P0-1: Argon2id(m=64 MiB, t=3, p=1) PHC-хеш PIN. ~64 MiB RAM на проверку —
+/// 4-8-значный PIN больше не подбирается "за секунды".
+fn argon2_phc(pin: &str, salt: &[u8]) -> Result<String, NexxusError> {
+    use argon2::{password_hash::{PasswordHasher, SaltString}, Argon2, Params};
+    let params = Params::new(65536, 3, 1, Some(32))
+        .map_err(|e| NexxusError::Vault(format!("argon2 params: {e}")))?;
+    let salt_str = SaltString::encode_b64(salt)
+        .map_err(|e| NexxusError::Vault(format!("argon2 salt: {e}")))?;
+    let argon = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let hash = argon.hash_password(pin.as_bytes(), &salt_str)
+        .map_err(|e| NexxusError::Vault(format!("argon2 hash: {e}")))?;
+    Ok(hash.to_string())
+}
+
+/// Проверка PIN по phc (constant-time внутри argon2-крейта).
+fn argon2_verify(pin: &str, phc: &str) -> bool {
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    match PasswordHash::new(phc) {
+        Ok(h) => argon2::Argon2::default().verify_password(pin.as_bytes(), &h).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// Результат `enter`.
@@ -134,8 +165,14 @@ impl PanicManager {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
         let state = StateFile {
             salt_hex: hex::encode(salt),
-            pin_hash_hex: hash_pin(pin, &salt),
-            duress_hash_hex: duress_pin.map(|d| hash_pin(d, &salt)),
+            // P0-1: новые файлы — только Argon2id, без быстрого SHA-256 верификатора
+            pin_hash_hex: None,
+            duress_hash_hex: None,
+            pin_phc: Some(argon2_phc(pin, &salt)?),
+            duress_phc: match duress_pin {
+                Some(d) => Some(argon2_phc(d, &salt)?),
+                None => None,
+            },
             fail_count: 0,
             cooldown_until: 0,
         };
@@ -170,12 +207,26 @@ impl PanicManager {
         }
         let salt = hex::decode(&state.salt_hex)
             .map_err(|e| NexxusError::Vault(format!("невалидный salt: {e}")))?;
-        let entered = hash_pin(pin, &salt);
         let mut new_state = state.clone();
-        let outcome = if Some(&entered) == new_state.duress_hash_hex.as_ref() {
+        // P0-1: сначала phc (Argon2id), legacy hash — только для миграции старого файла
+        let duress_hit = match &new_state.duress_phc {
+            Some(phc) => argon2_verify(pin, phc),
+            None => new_state.duress_hash_hex.as_ref().is_some_and(|h| *h == hash_pin(pin, &salt)),
+        };
+        let pin_hit = match &new_state.pin_phc {
+            Some(phc) => argon2_verify(pin, phc),
+            None => new_state.pin_hash_hex.as_ref().is_some_and(|h| *h == hash_pin(pin, &salt)),
+        };
+        let outcome = if duress_hit && new_state.duress_phc.is_some() {
             // Duress: кулдаун не трогаем, отвечаем ложным успехом снаружи.
             EnterOutcome::Duress
-        } else if entered == new_state.pin_hash_hex {
+        } else if pin_hit {
+            // миграция legacy-файла: успешный вход → перезаписываем на Argon2id
+            if new_state.pin_phc.is_none() {
+                new_state.pin_phc = Some(argon2_phc(pin, &salt)?);
+                new_state.pin_hash_hex = None;
+                new_state.duress_hash_hex = None;
+            }
             new_state.fail_count = 0;
             new_state.cooldown_until = 0;
             EnterOutcome::Ok
@@ -217,6 +268,43 @@ pub fn wipe_file(path: &Path) -> Result<(), NexxusError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panic_state_uses_argon2id_and_migrates_legacy() {
+        // P0-1 регрессионный тест: arm() пишет phc (argon2id), без pin_hash_hex;
+        // legacy-файл с pin_hash_hex после успешного enter мигрирует на phc.
+        let path = tmp_state("argon2");
+        let mut pm = PanicManager::load(path.clone()).unwrap();
+        pm.arm("1234", Some("9999")).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("$argon2id$"), "ожидался argon2id phc: {raw}");
+        assert!(!raw.contains("pin_hash_hex"), "legacy-хеш не должен писаться: {raw}");
+        assert_eq!(pm.enter("1234", 1000).unwrap(), EnterOutcome::Ok);
+        assert_eq!(pm.enter("9999", 1001).unwrap(), EnterOutcome::Duress);
+        assert!(matches!(pm.enter("0000", 1002).unwrap(), EnterOutcome::Wrong { .. }));
+
+        // legacy-файл (только pin_hash_hex) открывается и мигрирует
+        let mut salt = [0u8; SALT_LEN];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
+        let legacy = StateFile {
+            salt_hex: hex::encode(salt),
+            pin_hash_hex: Some(hash_pin("4321", &salt)),
+            duress_hash_hex: None,
+            pin_phc: None,
+            duress_phc: None,
+            fail_count: 0,
+            cooldown_until: 0,
+        };
+        let path2 = tmp_state("legacy");
+        let mut pm2 = PanicManager::load(path2.clone()).unwrap();
+        pm2.save(&legacy).unwrap();
+        pm2.state = Some(legacy);
+        assert_eq!(pm2.enter("4321", 2000).unwrap(), EnterOutcome::Ok);
+        let raw2 = std::fs::read_to_string(&path2).unwrap();
+        assert!(raw2.contains("$argon2id$"), "legacy должен мигрировать на argon2id: {raw2}");
+        assert!(!raw2.contains("pin_hash_hex"));
+        assert_eq!(pm2.enter("4321", 2001).unwrap(), EnterOutcome::Ok);
+    }
+
     use super::*;
 
     fn tmp_state(tag: &str) -> PathBuf {
