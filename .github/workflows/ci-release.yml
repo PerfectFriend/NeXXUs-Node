@@ -381,12 +381,32 @@ jobs:
           cd ..
           cp dist/SHA256SUMS dist/SHA256SUMS.minisig .
 
+      - name: 🧾 SBOM (cargo-cyclonedx, CycloneDX JSON) — P1-12 остаток
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json --output-file sbom.cdx.json
+
+      - name: 🔏 Attest build provenance (SLSA) для ассетов релиза — P1-12
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            dist/nexxusd
+            dist/nexxus-desktop
+            dist/*.deb
+            dist/*.AppImage
+            dist/app-debug.apk
+            dist/nexxusd-windows-x86_64.exe
+            SHA256SUMS
+            SHA256SUMS.minisig
+            sbom.cdx.json
+
       - name: 🚀 Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             SHA256SUMS
             SHA256SUMS.minisig
+            sbom.cdx.json
             dist/nexxusd
             dist/nexxus-desktop
             dist/*.deb
