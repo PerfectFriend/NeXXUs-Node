@@ -17,6 +17,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# P0-6 (аудит 2026-11-23): в дереве запрещены упакованные бинарники и архивы —
+# релизы раздаются ТОЛЬКО через GitHub Releases с minisign-подписью.
+for pat in '*.tar.gz' '*.tgz' '*.deb' '*.rpm' '*.zip' '*.AppImage' '*.exe' '*.apk'; do
+  while IFS= read -r -d '' f; do
+    echo "FAIL: архив/бинарник в дереве: $f (релизы — только через GitHub Releases)"
+    FAIL=1
+  done < <(git ls-files -z -- "$pat" 2>/dev/null || true)
+done
+
 FAIL=0
 MAGIC="72656462"  # hex "redb"
 
@@ -33,11 +42,11 @@ while IFS= read -r -d '' f; do
 
   # 2) крупные не-ассетные файлы
   case "$f" in
-    assets/*|src/assets/*|public/*|*/assets/*|*/public/*) ;;
+    assets/*|src/assets/*|*/assets/*) ;;
     *)
       sz=$(stat -c%s "$f")
       if [ "$sz" -gt 1048576 ]; then
-        echo "FAIL: файл >1 МБ вне assets/public: $f ($sz байт)"
+        echo "FAIL: файл >1 МБ вне assets: $f ($sz байт)"
         FAIL=1
       fi
       ;;

@@ -38,27 +38,17 @@ impl TelegramBot {
         // Значение никогда не логируется и не попадает в конфиги.
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         let json_cfg = read_json_config();
-        let token = std::env::var("NEXXUS_TG_BOT_TOKEN").ok().filter(|t| !t.is_empty()).or(json_cfg.0).or_else(|| {
-            // Чтение secrets-файла ВНЕШНЕГО инструмента (Hermes Agent) — осознанный fallback,
-            // унаследованный от домашней инфраструктуры; значение не логируется и не пишется в git.
-            std::fs::read_to_string(format!("{home}/.hermes/secrets/cathedral_bot_token"))
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|t| !t.is_empty())
-        });
+        // P1-13 (аудит 2026-11-23): fallback на secrets внешних инструментов удалён —
+        // нода читает только свои источники: env NEXXUS_TG_BOT_TOKEN или ~/.nexxus/telegram.json.
+        let _ = home;
+        let token = std::env::var("NEXXUS_TG_BOT_TOKEN").ok().filter(|t| !t.is_empty()).or(json_cfg.0);
 
         // Chat ID: env → secrets-файл → ~/.nexxus/telegram.json.
         // В репозитории идентификатора нет — он не должен попадать в git.
         let chat_id = std::env::var("NEXXUS_TG_CHAT_ID")
             .ok()
             .filter(|c| !c.is_empty())
-            .or(json_cfg.1)
-            .or_else(|| {
-                std::fs::read_to_string(format!("{home}/.hermes/secrets/nexxus_chat_id"))
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|c| !c.is_empty())
-            });
+            .or(json_cfg.1);
 
         Self {
             base_url: "https://api.telegram.org".to_string(),
@@ -291,8 +281,9 @@ pub fn telegram_config_status() -> serde_json::Value {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let env_token = std::env::var("NEXXUS_TG_BOT_TOKEN").ok().filter(|t| !t.is_empty()).is_some();
     let env_chat = std::env::var("NEXXUS_TG_CHAT_ID").ok().filter(|c| !c.is_empty()).is_some();
-    let sec_token = std::path::Path::new(&format!("{home}/.hermes/secrets/cathedral_bot_token")).exists();
-    let sec_chat = std::path::Path::new(&format!("{home}/.hermes/secrets/nexxus_chat_id")).exists();
+    // P1-13: ~/.hermes/secrets больше не читается — только свои источники
+    let sec_token = false;
+    let sec_chat = false;
     serde_json::json!({
         "token_set": env_token || json_cfg.0.is_some() || sec_token,
         "token_source": if env_token { "env" } else if json_cfg.0.is_some() { "ui (~/.nexxus/telegram.json)" } else if sec_token { "secrets file" } else { "none" },

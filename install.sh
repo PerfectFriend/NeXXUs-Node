@@ -235,7 +235,16 @@ NEXXUS_LOG_LEVEL=info
 EOF
 
 $SUDO chmod 644 /etc/nexxus/nexxus.conf
-$SUDO chmod -R 755 "${DEFAULT_DATA_DIR}"
+# P0-8 (аудит 2026-11-23): права на каталог данных — 750 только на сам каталог,
+# файлы с секретами (store.redb, *.seed.vault, panic.state) не трогаем (у них 0600).
+$SUDO chmod 750 "${DEFAULT_DATA_DIR}"
+$SUDO chown -R nexxus:nexxus "${DEFAULT_DATA_DIR}" 2>/dev/null || true
+# пост-инсталл-проверка: ни один файл с секретами не доступен "всем остальным"
+if $SUDO find "${DEFAULT_DATA_DIR}" -type f -perm /077 | grep -q .; then
+  echo -e "${RED}❌ SECURITY: секретные файлы доступны others (perm /077):${NC}"
+  $SUDO find "${DEFAULT_DATA_DIR}" -type f -perm /077
+  exit 1
+fi
 
 # 8. High-Performance NVMe & RAM Sysctl Optimizations
 echo -e "⚙️  Applying kernel tuning for NVMe IOPS and high-concurrency P2P networking..."

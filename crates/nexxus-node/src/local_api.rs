@@ -409,7 +409,9 @@ impl LocalApi {
 
     /// Устанавливает токен доступа к API (из api_auth::load_or_create_token).
     pub fn set_api_token(&self, token: String) {
-        *self.api_token.lock().unwrap() = Some(token);
+        // P1-1 (аудит 2026-11-23): токен нормализуется в lowercase при загрузке,
+        // чтобы hex-токен в любом регистре проходил проверку.
+        *self.api_token.lock().unwrap() = Some(token.to_ascii_lowercase());
     }
 
     #[cfg(feature = "tor")]
@@ -1988,12 +1990,19 @@ impl LocalApi {
     ) -> Result<(), NexxusError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // Read the full header block (peek already consumed nothing).
+        // P1-1 (аудит 2026-11-23): лимит 8 KiB на весь заголовок + таймаут 5 с (anti-slowloris).
         let mut full = head.to_string();
         let mut tmp = [0u8; 2048];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while !full.contains("\r\n\r\n") {
-            match stream.read(&mut tmp).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => full.push_str(&String::from_utf8_lossy(&tmp[..n])),
+            if full.len() > 8192 {
+                return Err(NexxusError::Io("metrics header too large".into()));
+            }
+            let read = tokio::time::timeout_at(deadline, stream.read(&mut tmp)).await;
+            match read {
+                Err(_) => return Err(NexxusError::Io("metrics header timeout".into())),
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => full.push_str(&String::from_utf8_lossy(&tmp[..n])),
             }
         }
         let token_ok = match self.api_token.lock().unwrap().as_ref() {
@@ -2002,9 +2011,15 @@ impl LocalApi {
                 let supplied = full
                     .lines()
                     .find_map(|l| {
-                        let l = l.to_ascii_lowercase();
-                        l.strip_prefix("authorization: bearer ")
-                            .map(|t| t.trim().to_string())
+                        // P1-1: в lowercase только ИМЯ заголовка, значение токена — как есть
+                        let (name, val) = l.split_once(':')?;
+                        if name.trim().eq_ignore_ascii_case("authorization") {
+                            val.trim().strip_prefix("Bearer ")
+                                .or_else(|| val.trim().strip_prefix("bearer "))
+                                .map(|t| t.trim().to_string())
+                        } else {
+                            None
+                        }
                     })
                     .unwrap_or_default();
                 !supplied.is_empty()
@@ -2120,6 +2135,22 @@ impl LocalApi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn api_token_uppercase_hex_is_normalized() {
+        // P1-1 регрессионный тест: set_api_token("AB..") хранит lowercase.
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::storage::ChunkStore::open(dir.path().join("s.redb")).unwrap());
+        let net = std::sync::Arc::new(crate::net::P2pNetwork::new(
+            nexxus_core::types::NodeId([1u8; 32]),
+            "127.0.0.1:0".parse().unwrap(),
+            store.clone(),
+        ));
+        let api = LocalApi::new(net, store);
+        api.set_api_token("AB".repeat(32));
+        let stored = api.api_token.lock().unwrap().clone().unwrap();
+        assert_eq!(stored, "ab".repeat(32));
+    }
+
     use super::*;
 
     fn req(method: &str, params: Option<Value>) -> JsonRpcRequest {

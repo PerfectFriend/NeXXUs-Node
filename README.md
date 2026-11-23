@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="#-quick-start"><img src="https://img.shields.io/badge/Release-v0.229.0--rc3-06b6d4?style=for-the-badge&logo=rust" alt="Release v0.229.0-rc3" /></a>
-  <a href="#-testing--verification"><img src="https://img.shields.io/badge/Rust_Tests-245%20Passed-10b981?style=for-the-badge&logo=checkmarx" alt="245 Rust Tests" /></a>
+  <a href="#-quick-start"><img src="https://img.shields.io/badge/Release-v0.228.0-06b6d4?style=for-the-badge&logo=rust" alt="Release v0.228.0" /></a>
+  <a href="#-testing--verification"><img src="https://img.shields.io/badge/Rust_Tests-265%20Passed-10b981?style=for-the-badge&logo=checkmarx" alt="265 Rust Tests" /></a>
   <a href="#-core-architecture"><img src="https://img.shields.io/badge/Vault-AES--256--GCM%20%2B%20PBKDF2--600k-8b5cf6?style=for-the-badge&logo=shield" alt="Vault Security" /></a>
   <a href="#-storage-engine"><img src="https://img.shields.io/badge/Storage-Reed--Solomon_(4%2B2)_GF(2^8)-f59e0b?style=for-the-badge&logo=speedtest" alt="Reed Solomon" /></a>
   <a href="#-network-transport"><img src="https://img.shields.io/badge/Network-Tor%20v3%20Hidden%20Services-ec4899?style=for-the-badge&logo=torproject" alt="Tor v3" /></a>
@@ -51,7 +51,7 @@
 4. **Anonymous P2P Network**:
    * Native **Tor v3 onion routing** with 56-character base32 hidden services (`.onion`).
    * **Kademlia DHT** routing with XOR distance calculations.
-   * Anti-Sybil protection through calibrated Proof-of-Work (PoW).
+   * Anti-Sybil: per-IP connection limits and Kademlia peer scoring (PoW is on the roadmap, not implemented yet).
 5. **Native Daemon & Packaging**:
    * Pure native Rust binary (`nexxusd`).
    * Systemd service configured with dedicated unprivileged `nexxus` user (`ProtectSystem=full`, `PrivateTmp=true`).
@@ -136,7 +136,7 @@ sudo dpkg -i dist/nexxus-node_2.0.0_amd64.deb
 ## 🧪 Testing & Verification
 
 ```bash
-# 1. Run all Rust workspace tests (245 tests)
+# 1. Run all Rust workspace tests (265 tests)
 cargo test --workspace
 
 # 2. Verify C-9 Vault Key Leakage immunity
