@@ -17,22 +17,22 @@ echo "=========================================================="
 echo "📦 Building Debian/Ubuntu Package: ${PKG_NAME}_${VERSION}_${ARCH}.deb"
 echo "=========================================================="
 
-# 1. Compile standalone Node.js bundle with esbuild
-echo "⚡ [1/5] Bundling standalone executable via esbuild..."
+# 1. Compile native Rust daemon binary
+echo "⚡ [1/5] Building native Rust nexxus-node release binary..."
 mkdir -p dist
-npx esbuild scripts/linux-daemon.ts \
-  --bundle \
-  --platform=node \
-  --format=cjs \
-  --outfile=dist/nexxusd.cjs
-chmod +x dist/nexxusd.cjs
+cargo build --release -p nexxus-node
+BIN_PATH="${CARGO_TARGET_DIR:-target}/release/nexxusd"
+if [ ! -f "$BIN_PATH" ]; then
+  BIN_PATH="target/release/nexxusd"
+fi
+cp "$BIN_PATH" dist/nexxusd
+chmod 755 dist/nexxusd
 
 # 2. Prepare Debian filesystem staging tree
 echo "📁 [2/5] Creating Debian package tree structure..."
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR/DEBIAN"
 mkdir -p "$BUILD_DIR/usr/bin"
-mkdir -p "$BUILD_DIR/usr/lib/nexxus"
 mkdir -p "$BUILD_DIR/etc/nexxus"
 mkdir -p "$BUILD_DIR/etc/systemd/system"
 mkdir -p "$BUILD_DIR/var/lib/nexxus/chunks"
@@ -40,16 +40,8 @@ mkdir -p "$BUILD_DIR/var/lib/nexxus/meta"
 mkdir -p "$BUILD_DIR/var/lib/nexxus/logs"
 
 # 3. Copy binary and configuration files
-echo "📄 [3/5] Installing daemon bundle & wrapper script..."
-cp dist/nexxusd.cjs "$BUILD_DIR/usr/lib/nexxus/nexxusd.cjs"
-chmod 755 "$BUILD_DIR/usr/lib/nexxus/nexxusd.cjs"
-
-# Create /usr/bin/nexxusd wrapper that explicitly executes node on /usr/lib/nexxus/nexxusd.cjs
-cat <<'EOF' > "$BUILD_DIR/usr/bin/nexxusd"
-#!/bin/sh
-# NeXXUs Protocol - Global CLI Launcher
-exec node /usr/lib/nexxus/nexxusd.cjs "$@"
-EOF
+echo "📄 [3/5] Installing native daemon binary..."
+cp dist/nexxusd "$BUILD_DIR/usr/bin/nexxusd"
 chmod 755 "$BUILD_DIR/usr/bin/nexxusd"
 
 cat <<'EOF' > "$BUILD_DIR/etc/nexxus/nexxus.conf"

@@ -18,14 +18,17 @@ mkdir -p "$DIST_DIR"
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR/bin"
 
-# 1. Compile bundle if not present
-if [ ! -f "$DIST_DIR/nexxusd.cjs" ]; then
-  echo "⚡ Compiling nexxusd.cjs standalone bundle..."
-  npx esbuild scripts/linux-daemon.ts \
-    --bundle \
-    --platform=node \
-    --format=cjs \
-    --outfile="$DIST_DIR/nexxusd.cjs"
+# 1. Compile native binary if cargo is present
+if [ ! -f "$DIST_DIR/nexxusd.exe" ]; then
+  if command -v cargo >/dev/null 2>&1; then
+    echo "⚡ Compiling native Rust binary (nexxusd)..."
+    cargo build --release -p nexxus-node --target x86_64-pc-windows-gnu 2>/dev/null || cargo build --release -p nexxus-node 2>/dev/null || true
+    if [ -f "target/x86_64-pc-windows-gnu/release/nexxusd.exe" ]; then
+      cp target/x86_64-pc-windows-gnu/release/nexxusd.exe "$DIST_DIR/nexxusd.exe"
+    elif [ -f "target/release/nexxusd.exe" ]; then
+      cp target/release/nexxusd.exe "$DIST_DIR/nexxusd.exe"
+    fi
+  fi
 fi
 
 # 2. Copy Windows launchers and bundle

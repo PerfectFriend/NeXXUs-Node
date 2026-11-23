@@ -448,6 +448,24 @@ fn main() {
             }
         });
 
+        // Wire v4 listener (ADR-0011): NEXXUS_P2P_V4_PORT>0 включает отдельный порт с Noise-handshake.
+        #[cfg(feature = "wire-v4")]
+        {
+            let v4port: u16 = crate::node_config::cfg_or_env(&conf, "p2p_v4_port", "NEXXUS_P2P_V4_PORT", "0")
+                .parse()
+                .unwrap_or(0);
+            if v4port > 0 {
+                let v4_addr = SocketAddr::new(listen_addr.ip(), v4port);
+                let net_v4 = Arc::clone(&net);
+                tokio::spawn(async move {
+                    if let Err(e) = net_v4.run_v4(v4_addr).await {
+                        eprintln!("nexxusd: v4 network error: {e}");
+                    }
+                });
+                println!("nexxusd: wire-v4 listener on {v4_addr}");
+            }
+        }
+
         // Локальное WebSocket API: принимает соединения от nexxus-desktop.
         let epoch_api = Arc::clone(&api);
         let api_task = tokio::spawn(async move {

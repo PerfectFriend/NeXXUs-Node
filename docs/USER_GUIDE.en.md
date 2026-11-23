@@ -188,7 +188,7 @@ In `nexxus-desktop`, the **"🖥️ Hosting Provider"** panel visualizes capacit
 
 ## 9. Post-Quantum Hybrid Shield (PQC) & ZK-SNARK PoR
 
-- **FIPS 203 ML-KEM-768 ⊕ X25519 (Hybrid Shield)**: Session exchanges fuse classical X25519 ECDH with lattice-based Kyber-768 key encapsulation via HKDF-SHA256, mitigating "Harvest Now, Decrypt Later" quantum threats.
+- **FIPS 203 ML-KEM-768 ⊕ X25519 (Roadmap / Simulation)**: Architectural framework for hybrid key exchange combining classical elliptic curves with post-quantum lattice cryptography (scheduled for production in Phase 3).
 - **Succinct ZK-SNARK PoR**: Succinct 384-byte zero-knowledge proofs enable instant verification of storage commitments without downloading raw data blocks.
 
 ---

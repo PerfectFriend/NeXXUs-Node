@@ -13,5 +13,5 @@ Please select your preferred language:
 ### Quick Architecture Overview
 - **Storage**: 16 KiB fixed chunking, Reed-Solomon RS(4+2) fault tolerance.
 - **Privacy & Transport**: Native Tor Onion v3 routing with CGNAT bypass.
-- **Cryptographic Security**: ChaCha20-Poly1305, Post-Quantum ML-KEM-768 hybrid key exchange (FIPS 203), Succinct ZK-SNARK Proof-of-Retrievability (PoR).
+- **Cryptographic Security**: AES-256-GCM AEAD, PBKDF2-HMAC-SHA256 (600,000 rounds, C-9 verified), Merkle Proof-of-Retrievability (PoR), with Post-Quantum ML-KEM-768 hybrid roadmap.
 - **Ecosystem**: High-level SDK (`nexxus-sdk`), desktop monitor (`nexxus-desktop`), mobile nodes (`nexxus-mobile`).

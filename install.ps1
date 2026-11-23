@@ -1,4 +1,4 @@
-# ==============================================================================
+﻿# ==============================================================================
 # 🌌 NeXXUs Sovereign Storage Node - Windows Automated Installer (PowerShell)
 #
 # Quick 1-Line GitHub Installation (Run in PowerShell as Administrator):
@@ -76,21 +76,24 @@ New-Item -ItemType Directory -Force -Path "$DataDir\logs" | Out-Null
 Write-Host "📁 Storage Directory: $DataDir ($StorageGb GB allocation)" -ForegroundColor Cyan
 Write-Host "⚙️ Binary Directory:  $InstallDir" -ForegroundColor Cyan
 
-# 4. Fetch or Build standalone daemon bundle
-$bundleTarget = "$InstallDir\nexxusd.cjs"
+# 4. Fetch or Build standalone daemon binary
+$binaryTarget = "$InstallDir\nexxusd.exe"
 
-if (Test-Path "scripts\linux-daemon.ts") {
-    Write-Host "⚡ Compiling standalone bundle from local source repository..." -ForegroundColor Cyan
-    npx esbuild scripts/linux-daemon.ts --bundle --platform=node --format=cjs --outfile="$bundleTarget"
+if (Test-Path "Cargo.toml") {
+    Write-Host "⚡ Compiling native Rust daemon from local repository..." -ForegroundColor Cyan
+    cargo build --release -p nexxus-node
+    if (Test-Path "target\release\nexxusd.exe") {
+        Copy-Item "target\release\nexxusd.exe" $binaryTarget -Force
+    } elseif (Test-Path "dist\nexxusd.exe") {
+        Copy-Item "dist\nexxusd.exe" $binaryTarget -Force
+    }
 } else {
-    Write-Host "📥 Fetching pre-bundled NeXXUs engine from GitHub..." -ForegroundColor Cyan
-    $rawUrl = "https://raw.githubusercontent.com/$Repo/main/dist/nexxusd.cjs"
+    Write-Host "📥 Fetching pre-built NeXXUs binary from GitHub release..." -ForegroundColor Cyan
+    $rawUrl = "https://github.com/$Repo/releases/latest/download/nexxusd-windows-x86_64.exe"
     try {
-        Invoke-WebRequest -Uri $rawUrl -OutFile $bundleTarget
+        Invoke-WebRequest -Uri $rawUrl -OutFile $binaryTarget
     } catch {
-        Write-Warning "Could not fetch bundle directly from main. Cloning repo..."
-        git clone "https://github.com/$Repo.git" "$env:TEMP\nexxus-repo"
-        Copy-Item "$env:TEMP\nexxus-repo\dist\nexxusd.cjs" $bundleTarget -Force
+        Write-Warning "Could not fetch release binary directly."
     }
 }
 

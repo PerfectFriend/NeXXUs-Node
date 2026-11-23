@@ -1242,13 +1242,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/nexxus
-Environment=NODE_ENV=production
+User=nexxus
+Group=nexxus
+WorkingDirectory=/var/lib/nexxus
 Environment=NEXXUS_DATA_DIR=/var/lib/nexxus
 Environment=NEXXUS_STORAGE_GB=${customStorageGb}
 Environment=NEXXUS_PORT=3999
-ExecStart=/usr/bin/npx tsx /opt/nexxus/scripts/linux-daemon.ts serve
+ExecStart=/usr/local/bin/nexxusd serve
 Restart=always
 RestartSec=5s
 LimitNOFILE=1048576
@@ -1280,13 +1280,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/nexxus
-Environment=NODE_ENV=production
+User=nexxus
+Group=nexxus
+WorkingDirectory=/var/lib/nexxus
 Environment=NEXXUS_DATA_DIR=/var/lib/nexxus
 Environment=NEXXUS_STORAGE_GB=${customStorageGb}
 Environment=NEXXUS_PORT=3999
-ExecStart=/usr/bin/npx tsx /opt/nexxus/scripts/linux-daemon.ts serve
+ExecStart=/usr/local/bin/nexxusd serve
 Restart=always
 RestartSec=5s
 LimitNOFILE=1048576

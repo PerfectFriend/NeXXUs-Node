@@ -188,7 +188,7 @@ En la aplicación `nexxus-desktop`, el panel **«🖥️ Proveedor de Alojamient
 
 ## 9. Protección Post-Cuántica (PQC) y ZK-SNARK PoR
 
-- **FIPS 203 ML-KEM-768 ⊕ X25519 (Escudo Híbrido)**: La negociación de claves combina el protocolo clásico X25519 con el algoritmo basado en retículos Kyber-768 mediante HKDF-SHA256, eliminando riesgos ante futuros ordenadores cuánticos («Cosechar ahora, descifrar después»).
+- **FIPS 203 ML-KEM-768 ⊕ X25519 (Hoja de ruta / Simulación)**: Marco arquitectónico para intercambio híbrido que combina curvas elípticas clásicas con criptografía poscuántica basada en retículos (programado para la Fase 3).
 - **Succinct ZK-SNARK PoR**: Pruebas compactas de 384 bytes de conocimiento cero que verifican la custodia de terabytes de información en menos de 5 milisegundos sin descargar bloques.
 
 ---

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = ["tor"]
+wire-v4 = ["nexxus-core/wire-v4"]
 tor = [
     "dep:arti-client",
     "dep:tor-rtcompat",

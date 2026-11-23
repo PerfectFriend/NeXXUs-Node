@@ -671,6 +671,99 @@ impl P2pNetwork {
     /// Bind listen address and accept connections forever. Each connection
     /// is handled in its own task, behind a global connection semaphore and
     /// per-IP rate limits (NET-01).
+    /// Wire v4 listener (ADR-0011): отдельный порт, Noise_XX handshake, далее тот же frame loop.
+    /// Включается env NEXXUS_P2P_V4_PORT (0 = выключен).
+    #[cfg(feature = "wire-v4")]
+    pub async fn run_v4(self: Arc<Self>, addr: SocketAddr) -> Result<(), NexxusError> {
+        let listener = TcpListener::bind(addr).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        let bound = listener.local_addr().map_err(|e| NexxusError::Io(e.to_string()))?;
+        crate::log_ev!("info", "v4.listen", "addr" => bound.to_string());
+        loop {
+            let (stream, peer_addr) = listener.accept().await.map_err(|e| NexxusError::Io(e.to_string()))?;
+            self.metrics.conns_accepted.fetch_add(1, Ordering::Relaxed);
+            let net = Arc::clone(&self);
+            task::spawn(async move {
+                let _permit = Arc::clone(&net.conn_sem).acquire_owned().await.ok();
+                if let Err(e) = net.handle_v4_conn(stream, peer_addr).await {
+                    crate::log_ev!("warn", "v4.conn.err", "err" => e.to_string());
+                }
+            });
+        }
+        }
+
+    /// v4 handshake (responder side) + frame loop поверх NoiseStream.
+    #[cfg(feature = "wire-v4")]
+    async fn handle_v4_conn(&self, mut stream: TcpStream, addr: SocketAddr) -> Result<(), NexxusError> {
+        use nexxus_core::wire::noise as nz;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pro = nz::prologue(&self.node_id(), &NodeId([0u8; 32]), 0);
+        let mut hs = nz::responder_start(&self.x25519_secret, &pro).map_err(NexxusError::Io)?;
+        // msg1 (e) — plaintext, но в u32-len кадре
+        let mut lenb = [0u8; 4];
+        stream.read_exact(&mut lenb).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        let n = u32::from_be_bytes(lenb) as usize;
+        if n == 0 || n > nz::MAX_NOISE_MSG {
+            return Err(NexxusError::Io("bad v4 msg1 len".into()));
+        }
+        let mut msg1 = vec![0u8; n];
+        stream.read_exact(&mut msg1).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        if hs.read(&msg1).map_err(NexxusError::Io)?.is_some() {
+            return Err(NexxusError::Io("unexpected early finish".into()));
+        }
+        let msg2 = hs.write().map_err(NexxusError::Io)?.ok_or_else(|| NexxusError::Io("no responder turn".into()))?;
+        stream.write_all(&(msg2.len() as u32).to_be_bytes()).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        stream.write_all(&msg2).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        let mut lenb = [0u8; 4];
+        stream.read_exact(&mut lenb).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        let n = u32::from_be_bytes(lenb) as usize;
+        if n == 0 || n > nz::MAX_NOISE_MSG {
+            return Err(NexxusError::Io("bad v4 msg3 len".into()));
+        }
+        let mut msg3 = vec![0u8; n];
+        stream.read_exact(&mut msg3).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        let transport = hs.read(&msg3).map_err(NexxusError::Io)?.ok_or_else(|| NexxusError::Io("v4 handshake not finished".into()))?;
+        let ns = crate::net::noise_stream::NoiseStream::new(stream, transport);
+        let peer = ConnectedPeer { node_id: None, addr };
+        self.handle_connection(ns, peer).await
+    }
+
+    /// v4 dial: Noise handshake (initiator) + announce + Ping/Pong поверх NoiseStream. Для e2e и будущих v4-диалов.
+    #[cfg(feature = "wire-v4")]
+    #[cfg_attr(not(test), allow(dead_code))] // используется e2e-тестом и будущими v4-диалами
+    pub async fn dial_v4_ping(&self, addr: SocketAddr) -> Result<(), NexxusError> {
+        use nexxus_core::wire::noise as nz;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = TcpStream::connect(addr).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        let pro = nz::prologue(&self.node_id(), &NodeId([0u8; 32]), 0);
+        let (mut hs, msg1) = nz::initiator_start(&self.x25519_secret, &pro).map_err(NexxusError::Io)?;
+        stream.write_all(&(msg1.len() as u32).to_be_bytes()).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        stream.write_all(&msg1).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        let mut lenb = [0u8; 4];
+        stream.read_exact(&mut lenb).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        let n = u32::from_be_bytes(lenb) as usize;
+        if n == 0 || n > nz::MAX_NOISE_MSG {
+            return Err(NexxusError::Io("bad v4 msg2 len".into()));
+        }
+        let mut msg2 = vec![0u8; n];
+        stream.read_exact(&mut msg2).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        if hs.read(&msg2).map_err(NexxusError::Io)?.is_some() {
+            return Err(NexxusError::Io("unexpected early finish".into()));
+        }
+        let msg3 = hs.write().map_err(NexxusError::Io)?.ok_or_else(|| NexxusError::Io("no initiator turn".into()))?;
+        stream.write_all(&(msg3.len() as u32).to_be_bytes()).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        stream.write_all(&msg3).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        let transport = hs.take_transport().map_err(NexxusError::Io)?.ok_or_else(|| NexxusError::Io("v4 handshake not finished".into()))?;
+        let mut ns = crate::net::noise_stream::NoiseStream::new(stream, transport);
+        let hs3 = self.announce_handshake(&mut ns, 0x0009).await?;
+        let ping = nexxus_core::wire::payloads::Ping;
+        self.send_signed_frame(&mut ns, &hs3.our_nonce, Opcode::Ping, 0x0001, &ping).await?;
+        let (op, _rid, _payload) = self.recv_verified_frame(&mut ns, &hs3).await?;
+        if op != Opcode::Pong {
+            return Err(NexxusError::Io(format!("expected Pong, got 0x{:02x}", op.to_u8())));
+        }
+        Ok(())
+    }
+
     pub async fn run(self: Arc<Self>) -> Result<(), NexxusError> {
         let listener = TcpListener::bind(self.listen_addr)
             .await
@@ -877,11 +970,14 @@ impl P2pNetwork {
         Ok(())
     }
 
-    async fn handle_connection(
+    async fn handle_connection<S>(
         &self,
-        mut stream: TcpStream,
+        mut stream: S,
         mut peer: ConnectedPeer,
-    ) -> Result<(), NexxusError> {
+    ) -> Result<(), NexxusError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
         let addr = peer.addr;
         if let Some(api) = self.local_api.lock().await.as_ref() {
             api.register_peer(addr, None, "inbound").await;
@@ -1064,15 +1160,18 @@ impl P2pNetwork {
         result
     }
 
-    async fn handle_opcode(
+    async fn handle_opcode<S>(
         &self,
-        stream: &mut TcpStream,
+        stream: &mut S,
         our_nonce: &[u8; 32],
         opcode: Opcode,
         request_id: u32,
         payload: &[u8],
         peer_addr: SocketAddr,
-    ) -> Result<(), NexxusError> {
+    ) -> Result<(), NexxusError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    {
         // Pause gate: while paused every frame gets an immediate 0x0007 error
         // and is not dispatched (makes node_pause/node_resume real).
         if self.is_paused() {
@@ -2227,5 +2326,26 @@ mod tests {
         s2.decay(1_000_000 + 3600);
         assert_eq!(s2.success, 64);
         assert_eq!(s2.fail, 32);
+    }
+    #[cfg(feature = "wire-v4")]
+    #[tokio::test]
+    async fn v4_noise_ping_over_v4_port() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ChunkStore::open(dir.path().join("store.redb")).unwrap());
+        let our_id = NodeId([0x43u8; 32]);
+        let net = Arc::new(P2pNetwork::new(our_id, "127.0.0.1:0".parse().unwrap(), store));
+        let net_clone = Arc::clone(&net);
+        let server = tokio::spawn(async move { net_clone.run().await });
+        // v4 listener на отдельном порту
+        let net_v4 = Arc::clone(&net);
+        let v4 = tokio::spawn(async move { net_v4.run_v4("127.0.0.1:0".parse().unwrap()).await });
+        v4.abort();
+        let port: u16 = 14401;
+        let net_v4 = Arc::clone(&net);
+        let v4 = tokio::spawn(async move { net_v4.run_v4(format!("127.0.0.1:{port}").parse().unwrap()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        net.dial_v4_ping(format!("127.0.0.1:{port}").parse().unwrap()).await.unwrap();
+        server.abort();
+        v4.abort();
     }
 }

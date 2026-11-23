@@ -79,18 +79,23 @@ else
   echo "✅ Node.js $(node -v) is available."
 fi
 
-# 3. Compile standalone bundle if needed
+# 3. Compile native Rust daemon binary if needed
 mkdir -p "$PROJECT_ROOT/dist"
-if [ ! -f "$PROJECT_ROOT/dist/nexxusd.cjs" ]; then
-  echo "⚡ Compiling standalone daemon bundle via esbuild..."
+if [ ! -f "$PROJECT_ROOT/dist/nexxusd" ]; then
+  echo "⚡ Compiling native Rust daemon binary (nexxusd)..."
   cd "$PROJECT_ROOT"
-  npx esbuild scripts/linux-daemon.ts --bundle --platform=node --format=cjs --outfile=dist/nexxusd.cjs
+  cargo build --release -p nexxus-node
+  BIN_PATH="${CARGO_TARGET_DIR:-target}/release/nexxusd"
+  if [ ! -f "$BIN_PATH" ]; then
+    BIN_PATH="target/release/nexxusd"
+  fi
+  cp "$BIN_PATH" "$PROJECT_ROOT/dist/nexxusd"
 fi
-chmod +x "$PROJECT_ROOT/dist/nexxusd.cjs"
+chmod 755 "$PROJECT_ROOT/dist/nexxusd"
 
 # 4. Install global executable
 echo "🔗 Installing global 'nexxusd' CLI binary..."
-$SUDO cp "$PROJECT_ROOT/dist/nexxusd.cjs" /usr/local/bin/nexxusd
+$SUDO cp "$PROJECT_ROOT/dist/nexxusd" /usr/local/bin/nexxusd
 $SUDO chmod 755 /usr/local/bin/nexxusd
 
 # 5. Storage Directory & Permissions

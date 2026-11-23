@@ -18,17 +18,18 @@ echo "=========================================================="
 echo "📦 Building Linux Distribution Packages: $PKG_NAME v$VERSION ($ARCH)"
 echo "=========================================================="
 
-# 1. Compile standalone Node.js daemon bundle with esbuild
+# 1. Compile native daemon binary
 mkdir -p "$DIST_DIR"
-if [ ! -f "$DIST_DIR/nexxusd.cjs" ]; then
-  echo "⚡ [1/4] Bundling standalone executable via esbuild..."
-  npx esbuild scripts/linux-daemon.ts \
-    --bundle \
-    --platform=node \
-    --format=cjs \
-    --outfile="$DIST_DIR/nexxusd.cjs"
+if [ ! -f "$DIST_DIR/nexxusd" ]; then
+  echo "⚡ [1/4] Building native Rust daemon binary (nexxusd)..."
+  cargo build --release -p nexxus-node
+  BIN_PATH="${CARGO_TARGET_DIR:-target}/release/nexxusd"
+  if [ ! -f "$BIN_PATH" ]; then
+    BIN_PATH="target/release/nexxusd"
+  fi
+  cp "$BIN_PATH" "$DIST_DIR/nexxusd"
 fi
-chmod +x "$DIST_DIR/nexxusd.cjs"
+chmod 755 "$DIST_DIR/nexxusd"
 
 # 2. Build Universal Linux Binary Tarball
 echo "📦 [2/4] Creating Universal Linux Tarball (${TAR_FILE})..."

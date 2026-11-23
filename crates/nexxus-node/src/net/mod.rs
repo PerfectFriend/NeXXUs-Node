@@ -3,6 +3,8 @@
 //! opcode dispatcher (Ping/Pong, KadFindNode/KadNodesFound, StoreChunk/FetchChunk).
 
 pub mod frame;
+#[cfg(feature = "wire-v4")]
+pub mod noise_stream;
 pub mod network;
 pub mod ratelimit;
 pub mod routing;

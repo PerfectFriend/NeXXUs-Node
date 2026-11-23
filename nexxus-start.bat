@@ -16,13 +16,13 @@ if %errorlevel% equ 0 (
     echo [*] Launching global nexxusd daemon...
     nexxusd serve
 ) else (
-    REM Check if local node_modules / scripts exist
-    if exist "%~dp0dist\nexxusd.cjs" (
-        echo [*] Running from local bundle dist\nexxusd.cjs...
-        node "%~dp0dist\nexxusd.cjs" serve
-    ) else if exist "%~dp0scripts\linux-daemon.ts" (
-        echo [*] Running via tsx from scripts\linux-daemon.ts...
-        npx tsx "%~dp0scripts\linux-daemon.ts" serve
+    REM Check if local target binary exists
+    if exist "%~dp0target\release\nexxusd.exe" (
+        echo [*] Running from target\release\nexxusd.exe...
+        "%~dp0target\release\nexxusd.exe" serve
+    ) else if exist "%~dp0dist\nexxusd.exe" (
+        echo [*] Running from dist\nexxusd.exe...
+        "%~dp0dist\nexxusd.exe" serve
     ) else (
         echo [ERROR] NeXXUs is not installed yet.
         echo Please run install.bat first!
