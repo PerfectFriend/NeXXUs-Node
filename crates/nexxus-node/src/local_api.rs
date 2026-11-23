@@ -1948,6 +1948,21 @@ impl LocalApi {
                 let mut buf = [0u8; 2048];
                 if let Ok(n) = stream.peek(&mut buf).await {
                     let head = String::from_utf8_lossy(&buf[..n]);
+                    // P1-2 (аудит 2026-11-23): Host должен быть loopback — защита от
+                    // DNS rebinding / cross-site WebSocket из браузера.
+                    let host_ok = head.lines().find_map(|l| {
+                        let (n, v) = l.split_once(':')?;
+                        if n.trim().eq_ignore_ascii_case("host") { Some(v.trim().to_string()) } else { None }
+                    }).map(|h| {
+                        let h = h.split(':').next().unwrap_or("");
+                        h == "127.0.0.1" || h == "localhost" || h == "[::1]" || h == "::1"
+                    }).unwrap_or(true); // нет Host (HTTP/1.0) — не WS, пусть идёт дальше
+                    if !host_ok {
+                        use tokio::io::AsyncWriteExt;
+                        let mut stream = stream;
+                        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await;
+                        return;
+                    }
                     if head.starts_with("GET /metrics")
                         && !head.to_ascii_lowercase().contains("upgrade:")
                     {
@@ -2073,7 +2088,26 @@ impl LocalApi {
         // Соединение начинается неаутентифицированным; после успешного
         // `auth` на нём можно выполнить один настоящий запрос.
         let mut authenticated = false;
-        while let Some(msg) = ws_receiver.next().await {
+        // P1-2 (аудит 2026-11-23): неаутентифицированное соединение живёт не более 5 с
+        // (anti-hold: локальный процесс/вкладка не должна блокировать UI навсегда),
+        // после успешного auth — idle-таймаут 120 с.
+        let auth_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut idle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let remaining = if authenticated { idle_deadline } else { auth_deadline }
+                .saturating_duration_since(tokio::time::Instant::now());
+            let msg = match tokio::time::timeout(remaining, ws_receiver.next()).await {
+                Err(_) => {
+                    // таймаут: auth не пройден за 5 с или простой после auth
+                    let resp = error_response(None, ERR_INVALID_REQUEST,
+                        if authenticated { "idle timeout".into() } else { "auth timeout".into() });
+                    let _ = ws_sender.send(Message::Text(serde_json::to_string(&resp).unwrap_or_default())).await;
+                    break;
+                }
+                Ok(m) => m,
+            };
+            let msg = match msg { Some(m) => m, None => break };
+            idle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
             let msg = msg.map_err(|e| NexxusError::Io(e.to_string()))?;
             match msg {
                 Message::Text(text) => {
@@ -2116,8 +2150,8 @@ impl LocalApi {
                             "nexxusd: DURESS PIN entered — wiping store {} and panic state",
                             store_path.display()
                         );
-                        let _ = crate::panic::wipe_file(&store_path);
-                        let _ = crate::panic::wipe_file(&crate::panic::PanicManager::default_path(&store_path));
+                        // P1-7: crypto-erase всех чувствительных путей (vault, backups, iou, token, tor)
+                        crate::panic::wipe_all_sensitive(&store_path);
                         std::process::exit(0);
                     }
                     // Корректно закрываем WebSocket соединение после ответа,

@@ -245,6 +245,55 @@ impl PanicManager {
     }
 }
 
+/// P1-7 (аудит 2026-11-23): единый реестр чувствительных путей рядом со стором.
+/// Duress-wipe обязан затирать ВСЕ эти пути (ключевой материал, а не только данные).
+pub fn sensitive_paths(store_path: &Path) -> Vec<std::path::PathBuf> {
+    let dir = store_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut v = vec![
+        store_path.to_path_buf(),
+        PanicManager::default_path(store_path),
+    ];
+    // seed vault(ы) и их tmp
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".seed.vault") || name.ends_with("vault.tmp") {
+                v.push(e.path());
+            }
+        }
+    }
+    // backups/ — полные копии стора
+    let backups = dir.join("backups");
+    if backups.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(&backups) {
+            for e in rd.flatten() {
+                v.push(e.path());
+            }
+        }
+        v.push(backups);
+    }
+    // IOU journal, api token, tor state, sync dir
+    for name in ["iou.log", "iou.log.tmp", "api.token", "api.token.tmp", "tor-state", "tor_state", "sync"] {
+        let p = dir.join(name);
+        if p.exists() {
+            v.push(p);
+        }
+    }
+    v
+}
+
+/// P1-7: затирание ВСЕХ чувствительных путей (crypto-erase ключевого материала).
+pub fn wipe_all_sensitive(store_path: &Path) {
+    for p in sensitive_paths(store_path) {
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = wipe_file(&p);
+        }
+    }
+}
+
 /// Необратимый wipe файла: перезапись нулями + удаление (best-effort zeroize
 /// на диске перед remove — на SSD это best-effort, но файл исчезает гарантированно).
 pub fn wipe_file(path: &Path) -> Result<(), NexxusError> {
@@ -268,6 +317,29 @@ pub fn wipe_file(path: &Path) -> Result<(), NexxusError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn p1_7_wipe_all_sensitive_leaves_no_secret_files() {
+        // P1-7 регрессионный тест: после duress-wipe в каталоге не остаётся
+        // ни одного файла с секретами (vault, backups, iou, token, tor).
+        let dir = std::env::temp_dir().join(format!("nexxus-wipeall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("backups")).unwrap();
+        std::fs::create_dir_all(dir.join("tor-state")).unwrap();
+        let store = dir.join("store.redb");
+        for f in ["store.redb", "panic.state", "x.seed.vault", "iou.log", "api.token"] {
+            std::fs::write(dir.join(f), b"secret").unwrap();
+        }
+        std::fs::write(dir.join("backups").join("b1.redb"), b"secret").unwrap();
+        std::fs::write(dir.join("tor-state").join("keys"), b"secret").unwrap();
+        wipe_all_sensitive(&store);
+        for f in ["store.redb", "panic.state", "x.seed.vault", "iou.log", "api.token"] {
+            assert!(!dir.join(f).exists(), "{} должен быть стёрт", f);
+        }
+        assert!(!dir.join("backups").join("b1.redb").exists());
+        assert!(!dir.join("tor-state").exists() || std::fs::read_dir(dir.join("tor-state")).map(|r| r.count() == 0).unwrap_or(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn panic_state_uses_argon2id_and_migrates_legacy() {
         // P0-1 регрессионный тест: arm() пишет phc (argon2id), без pin_hash_hex;
