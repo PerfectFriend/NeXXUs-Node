@@ -36,3 +36,36 @@ ADR-0011 (`docs/adr/0011-wire-v4.md`) — дизайн wire v4, вопросы �
 3. sync: `std::fs` в async-путях, пустые файлы пропускаются, версий не хранится (один индекс на файл).
 4. TON-контракты — прототипы, on-chain деплоя нет.
 5. `pub mod pqc` — simulation, не используется в прод-путях.
+
+
+---
+
+# Обновление 2026-11-23 — внешний аудит (Armageddon666), статусы закрытия
+
+Аудит: `Downloads/Аудит NeXXuS Node и ТЗ для кодера.md` (8 P0 + 14 P1). Статусы на HEAD после фиксов:
+
+| Находка | Статус | Коммит / примечание |
+| --- | --- | --- |
+| P0-6 бинарники в `public/packages/` | **закрыт** | `9c3ce30`: файлы удалены, `check-tree-hygiene.sh` запрещает архивы/бинарники в дереве. История: `git filter-repo` — задача владельца |
+| P0-8 `chmod -R 755` в install.sh | **закрыт** | `9c3ce30`: `chmod 750` только на каталог + пост-проверка `find -perm /077` |
+| P0-5 README (PoW, «аудировано», версии) | **закрыт** | `9c3ce30`: PoW убран, «аудировано» убрано, версия/число тестов реальные |
+| P1-1 `/metrics` (лимит, регистр токена) | **закрыт** | `9c3ce30`: лимит 8 KiB + таймаут 5 с, имя заголовка в lowercase, токен нормализуется при загрузке; тест `api_token_uppercase_hex_is_normalized` |
+| P1-13 telegram secrets из `~/.hermes` | **частично закрыт** | `9c3ce30`: fallback удалён из `telegram.rs`. Отзыв токенов в @BotFather + `filter-repo` — задача владельца |
+| P0-1 panic.state SHA-256 PIN | **закрыт** | `c7dd9d5`: Argon2id(m=64 MiB,t=3) PHC, legacy-файлы мигрируют при первом входе; тест `panic_state_uses_argon2id_and_migrates_legacy` |
+| P0-2 plaintext seed без PIN | **закрыт** | `c7dd9d5`: старт без PIN запрещён без `--insecure-plaintext-seed`; тест `p0_2_refuses_plaintext_without_flag` |
+| P1-8 vault tmp гонка прав/fsync | **закрыт** | `c7dd9d5`: `create_new`+mode 0600, fsync файла и каталога; тест `vault_file_is_0600_and_no_tmp_left` |
+| P1-7 duress wipe не чистит секреты | **закрыт** | `2e193e9`: реестр `sensitive_paths` + `wipe_all_sensitive` (vault, backups, iou, token, tor); тест `p1_7_wipe_all_sensitive_leaves_no_secret_files` |
+| P1-2 WS: auth-timeout, idle, Host | **закрыт** | `2e193e9`: auth deadline 5 с, idle 120 с, Host только loopback (anti DNS-rebinding) |
+| P1-6 kdf_rounds/ct_eq в vault | **закрыт** | `10efe91`: клемп сверху 10M (DoS), `ct_eq` сравнение; тест `p1_6_kdf_rounds_clamped_and_ct_eq` |
+| P0-4 replay записанной сессии v3 | **закрыт** | `bc646aa`: combined session nonce SHA256(min‖max) + монотонный seq в подписи (`v3_signing_bytes_seq`); тест `p0_4_replayed_frame_seq_is_rejected` |
+| P1-3 accept/limits | **закрыт** | `a511b39`: backoff при ошибке accept (v3+v4), GC `ip_limits`, IPv6 группируется по /64 |
+| P1-4 smp_inbox unbounded | **закрыт** | `a511b39`: bounded channel(1024), дроп при переполнении + метрика `smp_dropped` |
+| P0-3 vault v3 (Argon2id, ≥10 символов, decoy) | **частично** | C-9 закрыт ранее; полный v3-формат с пароль-фразой — следующий цикл |
+| P0-7 update.rs vs CI minisign | **открыт** | фаза 3 |
+| P1-5 wire-v4 по умолчанию | **открыт** | mixed-mode/auto-upgrade — следующий цикл |
+| P1-9 роли токена API | **открыт** | фаза 1 остаток |
+| P1-10 потоковый upload/download | **открыт** | фаза 4 |
+| P1-11/12 CI (deny, SBOM, SHA-пин) | **открыт** | фаза 3 |
+| P1-14 один UI/демон, archive | **открыт** | фаза 5 |
+
+Гейты на `a511b39`: `cargo test -p nexxus-node --features wire-v4` 0 failed; `cargo clippy -p nexxus-node --all-targets -- -D warnings` 0 ошибок; `check-tree-hygiene.sh` чист.
