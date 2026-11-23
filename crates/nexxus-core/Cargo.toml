@@ -23,9 +23,13 @@ curve25519-dalek = { workspace = true }
 aes-gcm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+snow = { version = "0.10.0", features = ["ring-accelerated"], optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+wire-v4 = ["dep:snow"]

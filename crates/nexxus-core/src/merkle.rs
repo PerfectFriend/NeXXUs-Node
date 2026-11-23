@@ -77,6 +77,150 @@ pub fn verify_proof(root: &[u8; 32], leaf: &[u8; 32], _leaf_index: usize, proof:
     computed == *root
 }
 
+/// --- Wire v4: domain-separated hashing (ADR-0011, закрывает H-6) ---
+/// Все v4-хеши имеют префикс домена, чтобы PoR-деревья, обычные chunk-деревья
+/// и SMP-Envelope не пересекались (cross-protocol replay невозможен).
+pub const DOMAIN_MERKLE_V4: &[u8] = b"nexxus-merkle-v4";
+pub const DOMAIN_POR_V4: &[u8] = b"nexxus-por-v4";
+
+fn hash_pair_v4(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(DOMAIN_MERKLE_V4);
+    h.update(l);
+    h.update(r);
+    h.finalize().into()
+}
+
+/// v4 Merkle root (domain-separated). Несовместим с v3 root — это намеренно.
+pub fn merkle_root_v4(leaves: &[[u8; 32]]) -> [u8; 32] {
+    if leaves.is_empty() {
+        let mut h = Sha256::new();
+        h.update(DOMAIN_MERKLE_V4);
+        return h.finalize().into();
+    }
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            let last = *level.last().unwrap();
+            level.push(last);
+        }
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            next.push(hash_pair_v4(&pair[0], &pair[1]));
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// v4 inclusion proof.
+pub fn merkle_proof_v4(leaves: &[[u8; 32]], leaf_index: usize) -> Vec<([u8; 32], bool)> {
+    let mut proof = Vec::new();
+    if leaves.is_empty() {
+        return proof;
+    }
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    let mut pos = leaf_index;
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            let last = *level.last().unwrap();
+            level.push(last);
+        }
+        let is_right = pos % 2 == 1;
+        let sibling_idx = if is_right { pos - 1 } else { pos + 1 };
+        proof.push((level[sibling_idx], is_right));
+        let mut next = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            next.push(hash_pair_v4(&pair[0], &pair[1]));
+        }
+        level = next;
+        pos /= 2;
+    }
+    proof
+}
+
+/// v4 proof verification.
+pub fn verify_proof_v4(root: &[u8; 32], leaf: &[u8; 32], proof: &[([u8; 32], bool)]) -> bool {
+    let mut computed = *leaf;
+    for (sibling, is_right) in proof {
+        computed = if *is_right {
+            hash_pair_v4(sibling, &computed)
+        } else {
+            hash_pair_v4(&computed, sibling)
+        };
+    }
+    computed == *root
+}
+
+/// --- Wire v4 PoR: challenge от ВЕРИФИКАТОРА (ADR-0011, закрывает H-5) ---
+/// Challenge содержит verifier_id и nonce — prover не может выбрать «удобный»
+/// challenge сам. Response биндится к chunk_hash, verifier и nonce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PorChallengeV4 {
+    pub verifier_id: [u8; 32],
+    pub chunk_hash: [u8; 32],
+    pub nonce: [u8; 32],
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PorResponseV4 {
+    pub response: [u8; 32],
+    pub merkle_proof: Vec<([u8; 32], bool)>,
+}
+
+impl PorChallengeV4 {
+    pub fn from_verifier(verifier_id: [u8; 32], chunk_hash: [u8; 32], nonce: [u8; 32], epoch: u64) -> Self {
+        Self { verifier_id, chunk_hash, nonce, epoch }
+    }
+}
+
+/// Prover: response = H(DOMAIN_POR_V4 ‖ verifier ‖ chunk_hash ‖ nonce ‖ epoch ‖ chunk)
+/// плюс Merkle proof включения chunk_hash в корень дерева чанка.
+pub fn por_response_v4(
+    chunk: &[u8],
+    chunk_hash: [u8; 32],
+    leaves: &[[u8; 32]],
+    leaf_index: usize,
+    challenge: &PorChallengeV4,
+) -> PorResponseV4 {
+    debug_assert_eq!(challenge.chunk_hash, chunk_hash);
+    let mut h = Sha256::new();
+    h.update(DOMAIN_POR_V4);
+    h.update(challenge.verifier_id);
+    h.update(chunk_hash);
+    h.update(challenge.nonce);
+    h.update(challenge.epoch.to_be_bytes());
+    h.update(chunk);
+    PorResponseV4 {
+        response: h.finalize().into(),
+        merkle_proof: merkle_proof_v4(leaves, leaf_index),
+    }
+}
+
+/// Verifier: проверяет, что prover знает chunk с данным chunk_hash,
+/// challenge сгенерирован именно этим verifier'ом, и proof сходится к root.
+pub fn por_verify_v4(
+    root: &[u8; 32],
+    chunk_hash: &[u8; 32],
+    response: &PorResponseV4,
+    challenge: &PorChallengeV4,
+    chunk: &[u8],
+) -> bool {
+    if challenge.chunk_hash != *chunk_hash {
+        return false;
+    }
+    let mut h = Sha256::new();
+    h.update(DOMAIN_POR_V4);
+    h.update(challenge.verifier_id);
+    h.update(challenge.chunk_hash);
+    h.update(challenge.nonce);
+    h.update(challenge.epoch.to_be_bytes());
+    h.update(chunk);
+    let expected: [u8; 32] = h.finalize().into();
+    expected == response.response && verify_proof_v4(root, chunk_hash, &response.merkle_proof)
+}
+
 /// Proof of Retrievability: challenge → response → verify.
 pub struct PorChallenge {
     pub seed: [u8; 32],
@@ -221,6 +365,42 @@ impl SnarkPorProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v4_domain_separation_differs_from_v3() {
+        let leaves: Vec<[u8; 32]> = (0u8..8).map(|i| [i; 32]).collect();
+        assert_ne!(merkle_root(&leaves), merkle_root_v4(&leaves));
+    }
+
+    #[test]
+    fn v4_proof_roundtrip_and_tamper() {
+        let leaves: Vec<[u8; 32]> = (0u8..8).map(|i| [i; 32]).collect();
+        let root = merkle_root_v4(&leaves);
+        let proof = merkle_proof_v4(&leaves, 3);
+        assert!(verify_proof_v4(&root, &leaves[3], &proof));
+        assert!(!verify_proof_v4(&root, &leaves[4], &proof));
+    }
+
+    #[test]
+    fn v4_por_binds_verifier_and_nonce() {
+        let chunk = b"hello nexxus";
+        let mut hh = Sha256::new();
+        hh.update(chunk);
+        let chunk_hash: [u8; 32] = hh.finalize().into();
+        let leaves = vec![[9u8; 32], chunk_hash, [7u8; 32]];
+        let root = merkle_root_v4(&leaves);
+        let ch = PorChallengeV4::from_verifier([1u8; 32], chunk_hash, [2u8; 32], 42);
+        let resp = por_response_v4(chunk, chunk_hash, &leaves, 1, &ch);
+        assert!(por_verify_v4(&root, &chunk_hash, &resp, &ch, chunk));
+        // чужой nonce — фейл
+        let ch2 = PorChallengeV4::from_verifier([1u8; 32], chunk_hash, [3u8; 32], 42);
+        assert!(!por_verify_v4(&root, &chunk_hash, &resp, &ch2, chunk));
+        // чужой verifier — фейл
+        let ch3 = PorChallengeV4::from_verifier([9u8; 32], chunk_hash, [2u8; 32], 42);
+        assert!(!por_verify_v4(&root, &chunk_hash, &resp, &ch3, chunk));
+        // prover не может подделать без данных: другой chunk с тем же challenge — фейл
+        assert!(!por_verify_v4(&root, &chunk_hash, &resp, &ch, b"forged"));
+    }
 
     #[test]
     fn matches_golden_vector_04_root() {

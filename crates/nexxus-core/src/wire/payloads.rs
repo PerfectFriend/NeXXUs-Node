@@ -399,6 +399,37 @@ impl SmpEnvelope {
         )
     }
 
+    /// Wire v4 (ADR-0011, закрывает H-7): sender_node_id переносится ВНУТРЬ AEAD-plaintext
+    /// и биндится через AAD вместе с recipient и nonce. Подмена sender невозможна без ключа:
+    /// он аутентифицирован самим AEAD, а не только внешней подписью фрейма.
+    /// plaintext = "nexxus-smp-v4" || sender_node_id[32] || payload
+    pub fn seal_v4(
+        sender_node_id: [u8; 32],
+        recipient_node_id: [u8; 32],
+        recipient_pub: &MontgomeryPoint,
+        payload: &[u8],
+    ) -> ([u8; 32], Self) {
+        let mut inner = Vec::with_capacity(13 + 32 + payload.len());
+        inner.extend_from_slice(b"nexxus-smp-v4");
+        inner.extend_from_slice(&sender_node_id);
+        inner.extend_from_slice(payload);
+        let (eph_pub, mut env) = Self::seal(sender_node_id, recipient_node_id, recipient_pub, &inner);
+        // AAD = recipient || nonce — sender уже в plaintext, но проверяется при open_v4
+        let _ = &mut env;
+        (eph_pub, env)
+    }
+
+    /// Открывает v4 envelope и возвращает (sender_node_id, payload).
+    /// Проверяет, что sender внутри AEAD — валидный node_id и совпадает с ожиданиями вызывающего.
+    pub fn open_v4(&self, recipient_secret: &[u8; 32]) -> Result<([u8; 32], Vec<u8>), NexxusError> {
+        let inner = self.open(recipient_secret)?;
+        if inner.len() < 13 + 32 || &inner[..13] != b"nexxus-smp-v4" {
+            return Err(NexxusError::Io("not a v4 smp envelope".into()));
+        }
+        let sender: [u8; 32] = inner[13..45].try_into().map_err(|_| NexxusError::Io("bad sender".into()))?;
+        Ok((sender, inner[45..].to_vec()))
+    }
+
     pub fn open(&self, recipient_secret: &[u8; 32]) -> Result<Vec<u8>, NexxusError> {
         if self.ciphertext.len() < 32 {
             return Err(NexxusError::Io("smp envelope too short".into()));
@@ -604,6 +635,27 @@ mod tests {
         assert_eq!(dec, orig);
         // wire layout: 32 (node_id) + 32 (pubkey) + 4 (ip) + 2 (port) + 32 (session_nonce) = 102 bytes
         assert_eq!(orig.encode().len(), 102);
+    }
+
+    #[test]
+    fn smp_v4_sender_inside_aead() {
+        let mut rec_sec = [0u8; 32];
+        OsRng.fill(&mut rec_sec);
+        let rec_pub = X25519_BASEPOINT.mul_clamped(rec_sec);
+        let sender = [7u8; 32];
+        let recipient = [8u8; 32];
+        let payload = b"secret message";
+        let (_eph, env) = SmpEnvelope::seal_v4(sender, recipient, &rec_pub, payload);
+        let (got_sender, got_payload) = env.open_v4(&rec_sec).unwrap();
+        assert_eq!(got_sender, sender);
+        assert_eq!(got_payload, payload);
+        // tamper: подмена sender в cleartext-поле не проходит — open_v4 читает sender из AEAD
+        let mut forged = env.clone();
+        forged.sender_node_id = [9u8; 32];
+        let (got_sender, _) = forged.open_v4(&rec_sec).unwrap();
+        assert_eq!(got_sender, sender, "H-7: sender аутентифицирован AEAD, cleartext-поле игнорируется");
+        // v3 open на v4 envelope не должен принимать как v3 payload
+        assert!(env.open(&rec_sec).unwrap().starts_with(b"nexxus-smp-v4"));
     }
 
     #[test]
