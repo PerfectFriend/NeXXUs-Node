@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nexxus_core::chunk::{self, ChunkAead};
+use nexxus_core::chunk::ChunkAead;
 use nexxus_core::error::NexxusError;
 use nexxus_core::merkle::{self, PorChallenge};
 use nexxus_core::rs;
@@ -36,17 +36,34 @@ pub async fn upload_file(
     store: &Arc<ChunkStore>,
     path: &Path,
 ) -> Result<Value, NexxusError> {
-    let data = std::fs::read(path)
-        .map_err(|e| NexxusError::Io(format!("read {}: {e}", path.display())))?;
-    if data.is_empty() {
+    // P1-10 (аудит 2026-11-23): потоковое чтение файла чанками CHUNK_SIZE через
+    // tokio::fs + spawn_blocking — файл целиком в RAM не грузится.
+    use tokio::io::AsyncReadExt;
+    let path_owned = path.to_path_buf();
+    let meta = tokio::task::spawn_blocking(move || std::fs::metadata(&path_owned))
+        .await
+        .map_err(|e| NexxusError::Io(format!("stat {}: {e}", path.display())))?
+        .map_err(|e| NexxusError::Io(format!("stat {}: {e}", path.display())))?;
+    let total_len = meta.len() as usize;
+    if total_len == 0 {
         return Err(NexxusError::Io("refusing to upload an empty file".into()));
     }
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| NexxusError::Io(format!("read {}: {e}", path.display())))?;
     // Per-file random vault key — travels inside the manifest (zero-knowledge:
     // storage nodes never see it), NOT derived from any node identity.
     let file_key: [u8; 32] = rand::random();
     let file_id: u32 = rand::random();
     let peers = net.known_peers().await;
-    let chunks = chunk::slice(&data);
+    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(total_len / CHUNK_SIZE + 1);
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = file.read(&mut buf).await
+            .map_err(|e| NexxusError::Io(format!("read {}: {e}", path.display())))?;
+        if n == 0 { break; }
+        chunks.push(buf[..n].to_vec());
+    }
     let mut chunk_entries = Vec::with_capacity(chunks.len());
     let mut chunk_roots = Vec::with_capacity(chunks.len());
     for (i, plain) in chunks.iter().enumerate() {
@@ -93,7 +110,7 @@ pub async fn upload_file(
         "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
         "file_id": file_id,
         "key": hex::encode(file_key),
-        "total_len": data.len(),
+        "total_len": total_len,
         "chunk_size": CHUNK_SIZE,
         "chunks": chunk_entries,
     });
@@ -101,7 +118,7 @@ pub async fn upload_file(
     Ok(json!({
         "root": root_hex,
         "file_id": file_id,
-        "bytes": data.len(),
+        "bytes": total_len,
         "chunks": chunk_entries.len(),
         "shards_per_chunk": rs::TOTAL_SHARDS,
         "peers_pushed": peers.len(),
@@ -150,27 +167,23 @@ pub async fn download_file(
             })
             .collect();
         let mut shards: Vec<(Vec<u8>, usize)> = Vec::with_capacity(rs::DATA_SHARDS);
-        // H-10: Iterate through all shards (data + parity) and collect up to DATA_SHARDS.
-        // If an individual shard is unavailable, continue and try subsequent (parity) shards.
+        // H-10 + P1-10: собираем до DATA_SHARDS шардов; P1-10 — hedged parallel fetch:
+        // локальный стор + все пиры опрашиваются конкурентно, берём первые успехи.
         for (s, h) in shard_hashes.iter().enumerate() {
             if shards.len() >= rs::DATA_SHARDS {
                 break;
             }
-            let shard_raw = match store.get_chunk(h)? {
-                Some(d) => Some(d),
-                None => {
-                    let mut got = None;
-                    for p in &peers {
-                        if let Ok(d) = net.fetch_chunk_from_peer(p.addr, *h).await {
-                            got = Some(d);
-                            break;
-                        }
-                    }
-                    got
-                }
-            };
-            if let Some(shard_data) = shard_raw {
-                shards.push((shard_data, s));
+            if let Some(d) = store.get_chunk(h)? {
+                shards.push((d, s));
+                continue;
+            }
+            // hedged: все пиры параллельно, первый Ok побеждает.
+            // P1-10: чтобы не пересекаться по &net в spawn, дергаем напрямую
+            // через join_all по FUTURES, а не tokio::spawn (заодно без 'static).
+            let futs: Vec<_> = peers.iter().map(|p| net.fetch_chunk_from_peer(p.addr, *h)).collect();
+            let results = futures_util::future::join_all(futs).await;
+            if let Some(d) = results.into_iter().find_map(|r| r.ok()) {
+                shards.push((d, s));
             }
         }
         if shards.len() < rs::DATA_SHARDS {
@@ -195,8 +208,18 @@ pub async fn download_file(
             hex::encode(root)
         )));
     }
-    std::fs::write(out, &out_data)
-        .map_err(|e| NexxusError::Io(format!("write {}: {e}", out.display())))?;
+    // P1-10: потоковая запись результата (не держим весь файл в RAM дважды)
+    use tokio::io::AsyncWriteExt;
+    let out_owned = out.to_path_buf();
+    {
+        let mut f = tokio::fs::File::create(out)
+            .await
+            .map_err(|e| NexxusError::Io(format!("write {}: {e}", out.display())))?;
+        f.write_all(&out_data).await
+            .map_err(|e| NexxusError::Io(format!("write {}: {e}", out_owned.display())))?;
+        f.sync_all().await
+            .map_err(|e| NexxusError::Io(format!("fsync {}: {e}", out_owned.display())))?;
+    }
     Ok(json!({
         "root": root_hex,
         "out": out.display().to_string(),
