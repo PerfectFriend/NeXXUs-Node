@@ -4,4 +4,4 @@
 
 - `linux-node/` — Node.js-реализация демона со своим handshake (порт 3999, без auth). В архиве, не собирается, не деплоится.
 
-Симулятор (TS) и React-UI из корня (src/, package.json, vite.config.ts) — остатки AI Studio; см. план миграции UI на Tauri в docs/plans/.
+- `react-ui/` — корневой React-UI (остатки AI Studio: `react-example` 0.0.0, `@google/genai`, `dev --host=0.0.0.0` — доступен из LAN). В архиве; CI больше не гоняет корневой npm (P1-14, `ci-release.yml`). Единственный UI — `nexxus-desktop/` (Tauri + свой vite).

@@ -19,20 +19,8 @@ jobs:
       - name: 📥 Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: ⚡ Set up Node.js LTS (v20)
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 20
-          cache: 'npm'
-
-      - name: 📦 Install npm dependencies
-        run: npm ci
-
-      - name: 🔍 Lint codebase (TypeScript)
-        run: npm run lint
-
-      - name: 🧪 Run Protocol & Golden Vector Test Suites (113 checks)
-        run: npm test
+      # P1-14: корневой React-UI (AI Studio) перенесён в archive/react-ui/ —
+      # протокольные тесты живут в Rust (cargo test), npm на корне не нужен.
 
       - name: ⚡ Build Native Rust Daemon (nexxusd)
         run: |
@@ -127,10 +115,12 @@ jobs:
         run: cargo build --release
         working-directory: nexxus-desktop
 
-      - name: 📦 Install npm dependencies
+      - name: 📦 Install npm dependencies (desktop frontend)
+        working-directory: nexxus-desktop
         run: npm ci
 
-      - name: 🔨 Build frontend bundle
+      - name: 🔨 Build frontend bundle (desktop)
+        working-directory: nexxus-desktop
         run: npm run build
 
       - name: 📤 Upload nexxus-desktop artifact
