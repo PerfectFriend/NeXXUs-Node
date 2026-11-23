@@ -189,3 +189,20 @@ mod p1_mode_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// P1-9 (аудит 2026-11-23): путь к read-only токену — env `NEXXUS_API_TOKEN_READ_FILE`
+/// или `~/.nexxus/api.token.read` (0600). Read-токен даёт мониторинг, не мутации.
+pub fn read_token_file_path() -> PathBuf {
+    if let Ok(p) = std::env::var("NEXXUS_API_TOKEN_READ_FILE") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".nexxus").join("api.token.read")
+}
+
+/// P1-9: read-only токен — опционален: если файла нет, создаём (как admin).
+pub fn load_or_create_read_token(path: &PathBuf) -> io::Result<String> {
+    load_or_create_token(path)
+}

@@ -190,6 +190,8 @@ pub struct LocalApi {
     tor_session: Arc<Mutex<Option<Arc<crate::tor::TorSession>>>>,
     /// Токен доступа к API (api_auth). None = fail-closed: кроме ping ничего не доступно.
     api_token: std::sync::Mutex<Option<String>>,
+    /// P1-9: read-only токен (мониторинг: read-методы + /metrics, без мутаций).
+    api_token_read: std::sync::Mutex<Option<String>>,
     /// Panic PIN менеджер (Phase A3): состояние в panic.state рядом со store.
     panic: Arc<std::sync::Mutex<crate::panic::PanicManager>>,
     /// Выставляется при duress-PIN: после отправки ответа — wipe стора + выход.
@@ -228,20 +230,84 @@ fn parse_hash_param(params: Option<Value>) -> Result<ChunkHash, NexxusError> {
     Ok(ChunkHash(arr))
 }
 
+/// P1-9 (аудит 2026-11-23): роль токена после auth.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AuthRole {
+    Admin,
+    Read,
+}
+
+/// Методы, разрешённые read-only токену (мониторинг, без мутаций и секретов).
+fn is_read_only_method(method: &str) -> bool {
+    matches!(
+        method,
+        "ping"
+            | "node_status"
+            | "node_metrics"
+            | "node_peers"
+            | "node_chunks"
+            | "node_name_get"
+            | "node_name_history"
+            | "node_name_list"
+            | "node_bootstrap_get"
+            | "node_onion_only_list"
+            | "node_policy_list"
+            | "node_smp"
+            | "node_sync_status"
+            | "node_provider_status"
+            | "node_provider_list"
+            | "node_por"
+            | "node_epoch"
+            | "node_tor"
+            | "panic_status"
+            | "node_identity_status"
+            | "node_seed_vault_status"
+            | "node_backup_list"
+            | "node_doctor"
+            | "node_econ"
+            | "iou_list"
+            | "iou_balance"
+    )
+}
+
+fn ct_eq_token(supplied: &str, expected: &str) -> bool {
+    // Constant-time compare: 256-битный секрет, без early-exit == по длине префикса.
+    !supplied.is_empty()
+        && supplied.len() == expected.len()
+        && bool::from(subtle::ConstantTimeEq::ct_eq(
+            supplied.as_bytes(),
+            expected.as_bytes(),
+        ))
+}
+
 /// Гейт аутентификации: вызывается до диспетчеризации метода.
+///
+/// P1-9: два токена — admin (`api.token`) и read-only (`api.token.read`).
+/// Read-токен даёт только is_read_only_method + /metrics.
 ///
 /// Возвращает `Some((response, close_after))`, если запрос обработан
 /// самим гейтом (ping / auth / отказ), и `None`, если надо диспетчить
 /// обычным образом (соединение уже аутентифицировано).
 ///
-/// Fail-closed: без настроенного токена (`expected == None`) доступен
-/// только `ping`.
+/// Fail-closed: без настроенного токена доступен только `ping`.
 fn auth_gate(
-    expected: Option<&str>,
+    expected_admin: Option<&str>,
+    expected_read: Option<&str>,
     req: &JsonRpcRequest,
-    authenticated: &mut bool,
+    role: &mut Option<AuthRole>,
 ) -> Option<(JsonRpcResponse, bool)> {
-    if *authenticated {
+    if role.is_some() {
+        // P1-9: read-only роль не повышается до admin на этом соединении
+        if *role == Some(AuthRole::Read) && !is_read_only_method(&req.method) {
+            return Some((
+                error_response(
+                    req.id.clone(),
+                    ERR_UNAUTHORIZED,
+                    format!("method '{}' requires admin token (read-only token)", req.method),
+                ),
+                true,
+            ));
+        }
         return None;
     }
     match req.method.as_str() {
@@ -256,30 +322,34 @@ fn auth_gate(
                 .and_then(|p| p.get("token"))
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
-            match expected {
-                // Constant-time compare: token is a 256-bit secret, do not leak
-                // prefix length via an early-exit == on strings.
-                Some(expected)
-                    if !supplied.is_empty()
-                        && supplied.len() == expected.len()
-                        && bool::from(
-                            subtle::ConstantTimeEq::ct_eq(
-                                supplied.as_bytes(),
-                                expected.as_bytes(),
-                            ),
-                        ) =>
-                {
-                    *authenticated = true;
-                    Some((
-                        ok_response(req.id.clone(), serde_json::json!({"authenticated": true})),
-                        false, // после успешного auth ждём настоящий запрос на этом же соединении
-                    ))
+            if let Some(expected) = expected_admin {
+                if ct_eq_token(supplied, expected) {
+                    *role = Some(AuthRole::Admin);
+                    return Some((
+                        ok_response(
+                            req.id.clone(),
+                            serde_json::json!({"authenticated": true, "role": "admin"}),
+                        ),
+                        false,
+                    ));
                 }
-                _ => Some((
-                    error_response(req.id.clone(), ERR_UNAUTHORIZED, "invalid or missing token".into()),
-                    true, // закрываем соединение
-                )),
             }
+            if let Some(expected) = expected_read {
+                if ct_eq_token(supplied, expected) {
+                    *role = Some(AuthRole::Read);
+                    return Some((
+                        ok_response(
+                            req.id.clone(),
+                            serde_json::json!({"authenticated": true, "role": "read"}),
+                        ),
+                        false,
+                    ));
+                }
+            }
+            Some((
+                error_response(req.id.clone(), ERR_UNAUTHORIZED, "invalid or missing token".into()),
+                true, // закрываем соединение
+            ))
         }
         _ => Some((
             error_response(
@@ -305,6 +375,7 @@ impl LocalApi {
             smp_inbox_tx,
             smp_inbox_rx: Arc::new(Mutex::new(Some(smp_inbox_rx))),
             api_token: std::sync::Mutex::new(None),
+            api_token_read: std::sync::Mutex::new(None),
             panic: Arc::new(std::sync::Mutex::new(
                 crate::panic::PanicManager::load(panic_path)
                 .unwrap_or_else(|_| {
@@ -413,6 +484,11 @@ impl LocalApi {
         // P1-1 (аудит 2026-11-23): токен нормализуется в lowercase при загрузке,
         // чтобы hex-токен в любом регистре проходил проверку.
         *self.api_token.lock().unwrap() = Some(token.to_ascii_lowercase());
+    }
+
+    /// P1-9: read-only токен (из api_auth::load_or_create_read_token).
+    pub fn set_api_token_read(&self, token: String) {
+        *self.api_token_read.lock().unwrap() = Some(token.to_ascii_lowercase());
     }
 
     #[cfg(feature = "tor")]
@@ -2021,28 +2097,27 @@ impl LocalApi {
                 Ok(Ok(n)) => full.push_str(&String::from_utf8_lossy(&tmp[..n])),
             }
         }
-        let token_ok = match self.api_token.lock().unwrap().as_ref() {
-            None => false, // fail-closed
-            Some(expected) => {
-                let supplied = full
-                    .lines()
-                    .find_map(|l| {
-                        // P1-1: в lowercase только ИМЯ заголовка, значение токена — как есть
-                        let (name, val) = l.split_once(':')?;
-                        if name.trim().eq_ignore_ascii_case("authorization") {
-                            val.trim().strip_prefix("Bearer ")
-                                .or_else(|| val.trim().strip_prefix("bearer "))
-                                .map(|t| t.trim().to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                !supplied.is_empty()
-                    && supplied.len() == expected.len()
-                    && bool::from(subtle::ConstantTimeEq::ct_eq(supplied.as_bytes(), expected.as_bytes()))
-            }
-        };
+        // P1-9: /metrics принимается и admin, и read-only токеном (ct_eq, fail-closed)
+        let supplied = full
+            .lines()
+            .find_map(|l| {
+                // P1-1: в lowercase только ИМЯ заголовка, значение токена — как есть
+                let (name, val) = l.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("authorization") {
+                    val.trim().strip_prefix("Bearer ")
+                        .or_else(|| val.trim().strip_prefix("bearer "))
+                        .map(|t| t.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let admin_tok = self.api_token.lock().unwrap().clone();
+        let read_tok = self.api_token_read.lock().unwrap().clone();
+        let token_ok = [admin_tok.as_deref(), read_tok.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|expected| ct_eq_token(&supplied, expected));
         let body = if token_ok {
             let mut body = self.network.metrics.prom();
             let store = self.network.store();
@@ -2088,20 +2163,20 @@ impl LocalApi {
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         // Соединение начинается неаутентифицированным; после успешного
         // `auth` на нём можно выполнить один настоящий запрос.
-        let mut authenticated = false;
+        let mut auth_role: Option<AuthRole> = None;
         // P1-2 (аудит 2026-11-23): неаутентифицированное соединение живёт не более 5 с
         // (anti-hold: локальный процесс/вкладка не должна блокировать UI навсегда),
         // после успешного auth — idle-таймаут 120 с.
         let auth_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut idle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            let remaining = if authenticated { idle_deadline } else { auth_deadline }
+            let remaining = if auth_role.is_some() { idle_deadline } else { auth_deadline }
                 .saturating_duration_since(tokio::time::Instant::now());
             let msg = match tokio::time::timeout(remaining, ws_receiver.next()).await {
                 Err(_) => {
                     // таймаут: auth не пройден за 5 с или простой после auth
                     let resp = error_response(None, ERR_INVALID_REQUEST,
-                        if authenticated { "idle timeout".into() } else { "auth timeout".into() });
+                        if auth_role.is_some() { "idle timeout".into() } else { "auth timeout".into() });
                     let _ = ws_sender.send(Message::Text(serde_json::to_string(&resp).unwrap_or_default())).await;
                     break;
                 }
@@ -2125,7 +2200,8 @@ impl LocalApi {
 
                     // Гейт аутентификации: обрабатывает ping/auth/отказы сам.
                     let expected = self.api_token.lock().unwrap().clone();
-                    if let Some((resp, close_after)) = auth_gate(expected.as_deref(), &req, &mut authenticated) {
+                    let expected_read = self.api_token_read.lock().unwrap().clone();
+                    if let Some((resp, close_after)) = auth_gate(expected.as_deref(), expected_read.as_deref(), &req, &mut auth_role) {
                         let text = serde_json::to_string(&resp).unwrap_or_default();
                         if ws_sender.send(Message::Text(text)).await.is_err() {
                             break;
@@ -2203,20 +2279,20 @@ mod tests {
 
     #[test]
     fn gate_denies_methods_without_auth() {
-        let mut auth = false;
-        let r = auth_gate(Some("secret"), &req("node_status", None), &mut auth).unwrap();
+        let mut auth: Option<AuthRole> = None;
+        let r = auth_gate(Some("secret"), None, &req("node_status", None), &mut auth).unwrap();
         assert_eq!(resp_code(&r.0), ERR_UNAUTHORIZED);
         assert!(r.1, "соединение должно закрываться");
-        assert!(!auth);
+        assert!(auth.is_none());
     }
 
     #[test]
     fn gate_allows_ping_without_auth() {
-        let mut auth = false;
-        let r = auth_gate(Some("secret"), &req("ping", None), &mut auth).unwrap();
+        let mut auth: Option<AuthRole> = None;
+        let r = auth_gate(Some("secret"), None, &req("ping", None), &mut auth).unwrap();
         assert_eq!(resp_code(&r.0), 0);
         assert!(!r.1, "ping не закрывает соединение");
-        assert!(!auth);
+        assert!(auth.is_none());
     }
 
     #[test]
@@ -2246,43 +2322,43 @@ mod tests {
 
     #[test]
     fn gate_rejects_wrong_token_and_closes() {
-        let mut auth = false;
+        let mut auth: Option<AuthRole> = None;
         let r = auth_gate(
-            Some("secret"),
+            Some("secret"), None,
             &req("auth", Some(serde_json::json!({"token": "wrong"}))),
             &mut auth,
         )
         .unwrap();
         assert_eq!(resp_code(&r.0), ERR_UNAUTHORIZED);
         assert!(r.1);
-        assert!(!auth);
+        assert!(auth.is_none());
     }
 
     #[test]
     fn gate_accepts_correct_token_and_keeps_connection_open() {
-        let mut auth = false;
+        let mut auth: Option<AuthRole> = None;
         let r = auth_gate(
-            Some("secret"),
+            Some("secret"), None,
             &req("auth", Some(serde_json::json!({"token": "secret"}))),
             &mut auth,
         )
         .unwrap();
         assert_eq!(resp_code(&r.0), 0);
         assert!(!r.1, "после auth соединение остаётся открытым для запроса");
-        assert!(auth);
+        assert!(auth.is_some());
 
         // После auth гейт больше не перехватывает — диспетчеризация обычная.
-        assert!(auth_gate(Some("secret"), &req("node_status", None), &mut auth).is_none());
+        assert!(auth_gate(Some("secret"), None, &req("node_status", None), &mut auth).is_none());
     }
 
     #[test]
     fn gate_fails_closed_without_configured_token() {
-        let mut auth = false;
+        let mut auth: Option<AuthRole> = None;
         // Даже верный-looking auth отклоняется, если токен не задан.
-        let r = auth_gate(None, &req("auth", Some(serde_json::json!({"token": "x"}))), &mut auth).unwrap();
+        let r = auth_gate(None, None, &req("auth", Some(serde_json::json!({"token": "x"}))), &mut auth).unwrap();
         assert_eq!(resp_code(&r.0), ERR_UNAUTHORIZED);
         // ping по-прежнему работает — для health-check монитора.
-        let r = auth_gate(None, &req("ping", None), &mut auth).unwrap();
+        let r = auth_gate(None, None, &req("ping", None), &mut auth).unwrap();
         assert_eq!(resp_code(&r.0), 0);
     }
 
@@ -2379,5 +2455,55 @@ mod tests {
         assert_eq!(list_res["count"], 1);
         assert_eq!(list_res["deals"][0]["root"], fake_root);
         assert_eq!(list_res["deals"][0]["price_nano_ton"], 1000);
+    }
+
+    #[test]
+    fn p1_9_read_token_allows_read_rejects_mutation() {
+        // read-only роль: мониторинг разрешён, мутации отклоняются
+        assert!(is_read_only_method("node_status"));
+        assert!(is_read_only_method("node_metrics"));
+        assert!(!is_read_only_method("node_upload"));
+        assert!(!is_read_only_method("node_identity_export"));
+        assert!(!is_read_only_method("panic_enter"));
+        // auth_gate: read-токен аутентифицируется с ролью read
+        let mut role = None;
+        let req_auth = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(serde_json::json!(1)),
+            method: "auth".into(),
+            params: Some(serde_json::json!({"token": "b".repeat(64)})),
+        };
+        let (resp, close) = auth_gate(Some(&"a".repeat(64)), Some(&"b".repeat(64)), &req_auth, &mut role).unwrap();
+        assert!(!close);
+        assert_eq!(role, Some(AuthRole::Read));
+        assert!(serde_json::to_string(&resp).unwrap().contains("read"));
+        // мутирующий метод с read-ролью отклоняется
+        let req_mut = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(serde_json::json!(2)),
+            method: "node_upload".into(),
+            params: None,
+        };
+        let (resp2, close2) = auth_gate(Some(&"a".repeat(64)), Some(&"b".repeat(64)), &req_mut, &mut role).unwrap();
+        assert!(close2);
+        assert!(serde_json::to_string(&resp2).unwrap().contains("admin"));
+        // read-метод с read-ролью проходит гейт (None = диспетчеризовать)
+        let req_ok = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(serde_json::json!(3)),
+            method: "node_status".into(),
+            params: None,
+        };
+        assert!(auth_gate(Some(&"a".repeat(64)), Some(&"b".repeat(64)), &req_ok, &mut role).is_none());
+        // admin-токен получает роль admin
+        let mut role2 = None;
+        let req_admin = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(serde_json::json!(4)),
+            method: "auth".into(),
+            params: Some(serde_json::json!({"token": "a".repeat(64)})),
+        };
+        let _ = auth_gate(Some(&"a".repeat(64)), Some(&"b".repeat(64)), &req_admin, &mut role2);
+        assert_eq!(role2, Some(AuthRole::Admin));
     }
 }

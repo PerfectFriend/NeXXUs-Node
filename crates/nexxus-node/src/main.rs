@@ -347,6 +347,21 @@ fn main() {
                 );
                 process::exit(1);
             }
+        };
+        // P1-9: read-only токен для мониторинга (read-методы + /metrics)
+        let read_token_path = api_auth::read_token_file_path();
+        match api_auth::load_or_create_read_token(&read_token_path) {
+            Ok(token) => {
+                crate::logging::register_secret(&token);
+                api.set_api_token_read(token);
+                println!("nexxusd: read-only API token загружен/создан, файл {}", read_token_path.display());
+            }
+            Err(e) => {
+                eprintln!(
+                    "nexxusd: warn: read-only токен не создан {}: {e} — /metrics и read-методы требуют admin-токен",
+                    read_token_path.display()
+                );
+            }
         }
 
         // --- Tor (feature `tor`, NEXXUS_TOR=0 чтобы выключить): bootstrap arti
