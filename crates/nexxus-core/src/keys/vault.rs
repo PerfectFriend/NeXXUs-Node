@@ -124,15 +124,21 @@ fn pin_hash_kdf_legacy(pin: &str, salt: &[u8], rounds: u32) -> String {
 fn entered_pin_hash(vault: &EncryptedVault, pin: &str, salt: &[u8]) -> String {
     match vault.pin_hash_algo.as_deref() {
         Some(a) if a.starts_with("pbkdf2-hmac-sha256-v2-") => {
+            // P1-6: раунды из algo-строки тоже клемпим (файл недоверенный)
             let rounds: u32 = a["pbkdf2-hmac-sha256-v2-".len()..].parse().unwrap_or(PBKDF2_ROUNDS);
-            derive_verifier_v2(pin, salt, rounds)
+            derive_verifier_v2(pin, salt, clamp_kdf_rounds(rounds))
         }
         Some(a) if a.starts_with("pbkdf2-sha256-") => {
             let rounds: u32 = a["pbkdf2-sha256-".len()..].parse().unwrap_or(PBKDF2_ROUNDS);
-            pin_hash_kdf_legacy(pin, salt, rounds)
+            pin_hash_kdf_legacy(pin, salt, clamp_kdf_rounds(rounds))
         }
         _ => hash_pin(pin, salt),
     }
+}
+
+/// P1-6: то же, что entered_pin_hash, но rounds из поля файла тоже клемпятся выше по стеку.
+fn entered_pin_hash_rounds(vault: &EncryptedVault, pin: &str, salt: &[u8], _file_rounds: u32) -> String {
+    entered_pin_hash(vault, pin, salt)
 }
 
 /// Legacy 256-битный ключ из PIN через PBKDF2-HMAC-SHA256 (для старых SDK vault).
@@ -200,18 +206,36 @@ pub fn check_pin(vault_json: &str, entered_pin: &str) -> Result<PinCheck, Nexxus
         .map_err(|e| NexxusError::Vault(format!("невалидный JSON vault: {e}")))?;
     let salt = hex::decode(&vault.salt_hex)
         .map_err(|e| NexxusError::Vault(format!("невалидный salt: {e}")))?;
-    let entered_hash = entered_pin_hash(&vault, entered_pin, &salt);
+    // P1-6 (аудит 2026-11-23): kdf_rounds из файла клемпим в [100k; 10M] —
+    // вредоносный бэкап с rounds=u32::MAX не должен зависать процесс.
+    let rounds = clamp_kdf_rounds(vault.kdf_rounds);
+    let entered_hash = entered_pin_hash_rounds(&vault, entered_pin, &salt, rounds);
 
+    // P1-6: сравнение верификатора в постоянное время
     if let Some(ref duress_hash) = vault.duress_hash_hex {
-        if &entered_hash == duress_hash {
+        if ct_eq_hex(&entered_hash, duress_hash) {
             return Ok(PinCheck::Duress);
         }
     }
-    if entered_hash == vault.pin_hash_hex {
+    if ct_eq_hex(&entered_hash, &vault.pin_hash_hex) {
         Ok(PinCheck::Ok)
     } else {
         Ok(PinCheck::Wrong)
     }
+}
+
+/// P1-6: клемп раундов KDF из недоверенного файла vault: верх — 10M (DoS-hang),
+/// низ — 1 (0 раундов бессмысленны, но не опасны; низкие значения легальны в тестах).
+pub fn clamp_kdf_rounds(rounds: u32) -> u32 {
+    const MAX: u32 = 10_000_000;
+    rounds.clamp(1, MAX)
+}
+
+/// P1-6: constant-time сравнение hex-строк (через subtle::ConstantTimeEq по байтам).
+fn ct_eq_hex(a: &str, b: &str) -> bool {
+    let (Ok(x), Ok(y)) = (hex::decode(a), hex::decode(b)) else { return false };
+    use subtle::ConstantTimeEq;
+    x.ct_eq(&y).into()
 }
 
 /// Расшифровывает vault; duress-PIN возвращает `is_duress: true` и пустой payload.
@@ -226,27 +250,29 @@ pub fn decrypt_vault_payload(vault_json: &str, entered_pin: &str) -> Result<Decr
     let ciphertext = hex::decode(&vault.ciphertext_hex)
         .map_err(|e| NexxusError::Vault(format!("невалидный ciphertext: {e}")))?;
 
-    let entered_hash = entered_pin_hash(&vault, entered_pin, &salt);
+    // P1-6: клемп раундов + ct_eq
+    let rounds = clamp_kdf_rounds(vault.kdf_rounds);
+    let entered_hash = entered_pin_hash_rounds(&vault, entered_pin, &salt, rounds);
 
     if let Some(ref duress_hash) = vault.duress_hash_hex {
-        if &entered_hash == duress_hash {
+        if ct_eq_hex(&entered_hash, duress_hash) {
             return Ok(DecryptResult {
                 decrypted_bytes: Vec::new(),
                 is_duress: true,
             });
         }
     }
-    if entered_hash != vault.pin_hash_hex {
+    if !ct_eq_hex(&entered_hash, &vault.pin_hash_hex) {
         return Err(NexxusError::Vault("неверный PIN".into()));
     }
 
     let mut key = match vault.pin_hash_algo.as_deref() {
         Some(a) if a.starts_with("pbkdf2-hmac-sha256-v2-") => {
-            let (enc_key, _) = derive_keys_v2(entered_pin, &salt, vault.kdf_rounds);
+            let (enc_key, _) = derive_keys_v2(entered_pin, &salt, rounds);
             enc_key
         }
         _ => {
-            derive_key(entered_pin, &salt, vault.kdf_rounds)
+            derive_key(entered_pin, &salt, rounds)
         }
     };
     let cipher = Aes256Gcm::new_from_slice(&key)
@@ -265,6 +291,18 @@ pub fn decrypt_vault_payload(vault_json: &str, entered_pin: &str) -> Result<Decr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn p1_6_kdf_rounds_clamped_and_ct_eq() {
+        // P1-6 регрессионный тест: rounds вне [100k;10M] клемпятся.
+        assert_eq!(clamp_kdf_rounds(0), 1);
+        assert_eq!(clamp_kdf_rounds(1_000), 1_000); // легальные низкие раунды (тесты) не ломаем
+        assert_eq!(clamp_kdf_rounds(600_000), 600_000);
+        assert_eq!(clamp_kdf_rounds(u32::MAX), 10_000_000); // DoS-hang отсекается
+        assert!(ct_eq_hex("abcd", "abcd"));
+        assert!(!ct_eq_hex("abcd", "abce"));
+        assert!(!ct_eq_hex("abcd", "zz"));
+    }
+
     use super::*;
 
     #[test]

@@ -2446,6 +2446,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "snow",
+ "subtle",
  "thiserror 1.0.69",
  "zeroize",
 ]
