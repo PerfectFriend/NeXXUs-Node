@@ -157,6 +157,19 @@ pub fn parse_v3(raw: &[u8]) -> Result<FrameV3, NexxusError> {
     })
 }
 
+/// P0-4 (аудит 2026-11-23): то же, плюс монотонный счётчик кадров (replay-защита).
+pub fn v3_signing_bytes_seq(
+    opcode: Opcode,
+    request_id: u32,
+    payload: &[u8],
+    session_nonce: &[u8; 32],
+    seq: u32,
+) -> Vec<u8> {
+    let mut v = v3_signing_bytes(opcode, request_id, payload, session_nonce);
+    v.extend_from_slice(&seq.to_be_bytes());
+    v
+}
+
 /// Message to sign for a v3 frame: opcode||req||len||payload||session_nonce.
 pub fn v3_signing_bytes(opcode: Opcode, request_id: u32, payload: &[u8], session_nonce: &[u8; 32]) -> Vec<u8> {
     let mut w = Writer::with_capacity(9 + payload.len() + 32);

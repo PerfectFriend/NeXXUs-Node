@@ -23,7 +23,7 @@ use nexxus_core::{
     epoch::verify_epoch_finalize,
     keys::identity::Identity,
     types::{ChunkHash, NodeId},
-    wire::header::v3_signing_bytes,
+    wire::header::v3_signing_bytes_seq,
     wire::opcode::Opcode,
     wire::payloads::{
         ErrorResponse, FetchChunk, FetchChunkResp, KadFindNode, KadNodesFound, KadPeer,
@@ -74,11 +74,36 @@ pub struct InboundSmp {
 ///
 // Result of a completed NodeAnnounce handshake on one connection:
 // peer id, peer verifying key and the two per-connection session nonces.
+/// P0-4: состояние подписи одного направления: combined session nonce + счётчик кадров.
+pub struct TxCrypto {
+    pub nonce: [u8; 32],
+    pub seq: u32,
+}
+
+/// P0-4: состояние приёма одного направления.
+pub struct RxCrypto {
+    pub nonce: [u8; 32],
+    pub seq: u32,
+}
+
+/// P0-4: combined session nonce, детерминированно одинаковый на обеих сторонах.
+pub fn combined_session_nonce(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = sha2::Sha256::new();
+    sha2::Digest::update(&mut h, lo);
+    sha2::Digest::update(&mut h, hi);
+    h.finalize().into()
+}
+
 pub struct Handshake {
     pub peer_id: NodeId,
     pub peer_key: VerifyingKey,
-    pub our_nonce: [u8; 32],
-    pub peer_nonce: [u8; 32],
+    /// P0-4: combined session nonce = SHA256(min(our,peer) || max(our,peer)) —
+    /// обе стороны вычисляют одинаково, свежесть вносит и получатель.
+    pub session_nonce: [u8; 32],
+    /// P0-4: монотонные счётчики кадров по направлениям (replay отклоняется).
+    pub send_seq: u32,
+    pub recv_seq: u32,
 }
 
 pub struct P2pNetwork {
@@ -410,8 +435,9 @@ impl P2pNetwork {
     /// Sign v3 signing bytes with our Ed25519 identity key and the
     /// per-connection session nonce (NET-02: fresh random nonce per connection,
     /// carried in our NodeAnnounce; never a static value).
-    fn sign_v3(&self, nonce: &[u8; 32], opcode: Opcode, request_id: u32, payload: &[u8]) -> [u8; 64] {
-        let msg = v3_signing_bytes(opcode, request_id, payload, nonce);
+    /// P0-4: подпись со счётчиком кадров (replay-защита).
+    fn sign_v3_seq(&self, nonce: &[u8; 32], seq: u32, opcode: Opcode, request_id: u32, payload: &[u8]) -> [u8; 64] {
+        let msg = v3_signing_bytes_seq(opcode, request_id, payload, nonce, seq);
         self.identity.sign(&msg)
     }
 
@@ -420,13 +446,15 @@ impl P2pNetwork {
     async fn send_signed_frame<T: Payload, S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
         &self,
         stream: &mut S,
-        nonce: &[u8; 32],
+        tx: &mut TxCrypto,
         opcode: Opcode,
         request_id: u32,
         payload: &T,
     ) -> Result<(), NexxusError> {
         let encoded = payload.encode();
-        let signature = self.sign_v3(nonce, opcode, request_id, &encoded);
+        // P0-4: подпись включает combined session nonce и монотонный seq
+        let signature = self.sign_v3_seq(&tx.nonce, tx.seq, opcode, request_id, &encoded);
+        tx.seq = tx.seq.wrapping_add(1);
         self.metrics.frames_out.fetch_add(1, Ordering::Relaxed);
         self.metrics.bytes_out.fetch_add(encoded.len() as u64, Ordering::Relaxed);
         send_frame_rl(stream, opcode, request_id, payload, &signature, &self.rl()).await
@@ -541,7 +569,9 @@ impl P2pNetwork {
         let mut our_nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut our_nonce);
         let our = self.our_announce(our_nonce);
-        self.send_signed_frame(stream, &our_nonce, Opcode::NodeAnnounce, req_id, &our)
+        // P0-4: сам announce — seq 0 с нашим raw nonce (combined ещё неизвестен peer'у)
+        let mut tx = TxCrypto { nonce: our_nonce, seq: 0 };
+        self.send_signed_frame(stream, &mut tx, Opcode::NodeAnnounce, req_id, &our)
             .await?;
         let (op, rid, payload, sig) = crate::net::frame::recv_frame_rl(stream, &self.rl()).await?;
         if op != Opcode::NodeAnnounce || rid != req_id {
@@ -564,16 +594,48 @@ impl P2pNetwork {
         // and its session nonce to this connection.
         let vk = VerifyingKey::from_bytes(&their.pubkey)
             .map_err(|e| NexxusError::Io(format!("bad announce pubkey: {e}")))?;
-        let msg = v3_signing_bytes(op, rid, &payload, &their.session_nonce);
+        // P0-4: announce peer'а проверяем со счётчиком seq=0
+        let msg = v3_signing_bytes_seq(op, rid, &payload, &their.session_nonce, 0);
         if !Identity::verify(&vk, &msg, &sig) {
             return Err(NexxusError::Io("bad announce reply signature".into()));
         }
         Ok(Handshake {
             peer_id: NodeId(their.node_id),
             peer_key: vk,
-            our_nonce,
-            peer_nonce: their.session_nonce,
+            session_nonce: combined_session_nonce(&our_nonce, &their.session_nonce),
+            send_seq: 1, // announce уже был seq 0
+            recv_seq: 1,
         })
+    }
+
+    /// P0-4: отправка кадра по handshake (combined nonce + send_seq).
+    pub async fn send_hs<T: Payload, S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+        &self,
+        stream: &mut S,
+        hs: &mut Handshake,
+        opcode: Opcode,
+        request_id: u32,
+        payload: &T,
+    ) -> Result<(), NexxusError> {
+        let mut tx = TxCrypto { nonce: hs.session_nonce, seq: hs.send_seq };
+        self.send_signed_frame(stream, &mut tx, opcode, request_id, payload).await?;
+        hs.send_seq = tx.seq;
+        Ok(())
+    }
+
+    /// P0-4: приём кадра по handshake: combined nonce + ожидаемый recv_seq (replay отклоняется).
+    pub async fn recv_hs<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+        &self,
+        stream: &mut S,
+        hs: &mut Handshake,
+    ) -> Result<(Opcode, u32, Vec<u8>), NexxusError> {
+        let (opcode, req_id, payload, sig) = crate::net::frame::recv_frame_rl(stream, &self.rl()).await?;
+        let msg = v3_signing_bytes_seq(opcode, req_id, &payload, &hs.session_nonce, hs.recv_seq);
+        if !Identity::verify(&hs.peer_key, &msg, &sig) {
+            return Err(NexxusError::Io("bad frame signature or replayed seq".into()));
+        }
+        hs.recv_seq = hs.recv_seq.wrapping_add(1);
+        Ok((opcode, req_id, payload))
     }
 
     /// Receive one frame and verify its Ed25519 signature against the peer key
@@ -582,13 +644,16 @@ impl P2pNetwork {
     pub async fn recv_verified_frame<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
         &self,
         stream: &mut S,
-        hs: &Handshake,
+        rx: &mut RxCrypto,
+        peer_key: &VerifyingKey,
     ) -> Result<(Opcode, u32, Vec<u8>), NexxusError> {
         let (opcode, req_id, payload, sig) = crate::net::frame::recv_frame_rl(stream, &self.rl()).await?;
-        let msg = v3_signing_bytes(opcode, req_id, &payload, &hs.peer_nonce);
-        if !Identity::verify(&hs.peer_key, &msg, &sig) {
-            return Err(NexxusError::Io("bad frame signature".into()));
+        // P0-4: combined nonce + ожидаемый счётчик — replay отклоняется
+        let msg = v3_signing_bytes_seq(opcode, req_id, &payload, &rx.nonce, rx.seq);
+        if !Identity::verify(peer_key, &msg, &sig) {
+            return Err(NexxusError::Io("bad frame signature or replayed seq".into()));
         }
+        rx.seq = rx.seq.wrapping_add(1);
         Ok((opcode, req_id, payload))
     }
 
@@ -597,10 +662,13 @@ impl P2pNetwork {
     pub async fn recv_req_frame<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
         &self,
         stream: &mut S,
-        hs: &Handshake,
+        hs: &mut Handshake,
     ) -> Result<(Opcode, u32, Vec<u8>), NexxusError> {
         const REQ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        match tokio::time::timeout(REQ_TIMEOUT, self.recv_verified_frame(stream, hs)).await {
+        let rx = &mut RxCrypto { nonce: hs.session_nonce, seq: hs.recv_seq };
+        let r = tokio::time::timeout(REQ_TIMEOUT, self.recv_verified_frame(stream, rx, &hs.peer_key)).await;
+        hs.recv_seq = rx.seq;
+        match r {
             Ok(r) => r,
             Err(_) => {
                 self.metrics.req_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -645,10 +713,10 @@ impl P2pNetwork {
             .connect_onion(onion_addr)
             .await
             .map_err(|e| NexxusError::Io(format!("tor connect {onion_addr}: {e}")))?;
-        let hs = self.announce_handshake(&mut stream, 0x0004).await?;
-        self.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::StoreChunk, 0x0003, chunk)
+        let mut hs = self.announce_handshake(&mut stream, 0x0004).await?;
+        self.send_hs(&mut stream, &mut hs, Opcode::StoreChunk, 0x0003, chunk)
             .await?;
-        let (op, _rid, payload) = self.recv_verified_frame(&mut stream, &hs).await?;
+        let (op, _rid, payload) = self.recv_hs(&mut stream, &mut hs).await?;
         match op {
             Opcode::StoreChunkAck => {
                 let ack = nexxus_core::wire::payloads::StoreChunkAck::decode(&payload)?;
@@ -754,10 +822,10 @@ impl P2pNetwork {
         stream.write_all(&msg3).await.map_err(|e| NexxusError::Io(e.to_string()))?;
         let transport = hs.take_transport().map_err(NexxusError::Io)?.ok_or_else(|| NexxusError::Io("v4 handshake not finished".into()))?;
         let mut ns = crate::net::noise_stream::NoiseStream::new(stream, transport);
-        let hs3 = self.announce_handshake(&mut ns, 0x0009).await?;
+        let mut hs3 = self.announce_handshake(&mut ns, 0x0009).await?;
         let ping = nexxus_core::wire::payloads::Ping;
-        self.send_signed_frame(&mut ns, &hs3.our_nonce, Opcode::Ping, 0x0001, &ping).await?;
-        let (op, _rid, _payload) = self.recv_verified_frame(&mut ns, &hs3).await?;
+        self.send_hs(&mut ns, &mut hs3, Opcode::Ping, 0x0001, &ping).await?;
+        let (op, _rid, _payload) = self.recv_hs(&mut ns, &mut hs3).await?;
         if op != Opcode::Pong {
             return Err(NexxusError::Io(format!("expected Pong, got 0x{:02x}", op.to_u8())));
         }
@@ -825,14 +893,14 @@ impl P2pNetwork {
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| NexxusError::Io(e.to_string()))?;
-        let hs = self.announce_handshake(&mut stream, 0x0009).await?;
+        let mut hs = self.announce_handshake(&mut stream, 0x0009).await?;
         let query = KadFindNode {
             target_node_id: target.0,
             count,
         };
-        self.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::KadFindNode, 0x0001, &query)
+        self.send_hs(&mut stream, &mut hs, Opcode::KadFindNode, 0x0001, &query)
             .await?;
-        let (op, _rid, payload) = self.recv_verified_frame(&mut stream, &hs).await?;
+        let (op, _rid, payload) = self.recv_hs(&mut stream, &mut hs).await?;
         if op != Opcode::KadNodesFound {
             return Err(NexxusError::Io(format!(
                 "expected KadNodesFound, got opcode 0x{:02x}",
@@ -883,11 +951,11 @@ impl P2pNetwork {
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| NexxusError::Io(e.to_string()))?;
-        let hs = self.announce_handshake(&mut stream, 0x0007).await?;
+        let mut hs = self.announce_handshake(&mut stream, 0x0007).await?;
         let fetch = FetchChunk { hash: hash.0 };
-        self.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::FetchChunk, 0x0004, &fetch)
+        self.send_hs(&mut stream, &mut hs, Opcode::FetchChunk, 0x0004, &fetch)
             .await?;
-        let (op, _rid, payload) = self.recv_req_frame(&mut stream, &hs).await?;
+        let (op, _rid, payload) = self.recv_req_frame(&mut stream, &mut hs).await?;
         if op == Opcode::ErrorResponse {
             let err = ErrorResponse::decode(&payload)?;
             return Err(NexxusError::Io(format!(
@@ -912,10 +980,10 @@ impl P2pNetwork {
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| NexxusError::Io(e.to_string()))?;
-        let hs = self.announce_handshake(&mut stream, 0x000a).await?;
-        self.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::SmpEnvelope, 0x0005, env)
+        let mut hs = self.announce_handshake(&mut stream, 0x000a).await?;
+        self.send_hs(&mut stream, &mut hs, Opcode::SmpEnvelope, 0x0005, env)
             .await?;
-        let (op, _rid, _payload) = self.recv_verified_frame(&mut stream, &hs).await?;
+        let (op, _rid, _payload) = self.recv_hs(&mut stream, &mut hs).await?;
         if op == Opcode::ErrorResponse {
             let err = ErrorResponse::decode(&_payload)?;
             return Err(NexxusError::Io(format!(
@@ -956,10 +1024,10 @@ impl P2pNetwork {
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| NexxusError::Io(e.to_string()))?;
-        let hs = self.announce_handshake(&mut stream, 0x000b).await?;
-        self.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::EpochFinalize, 0x0006, finalize)
+        let mut hs = self.announce_handshake(&mut stream, 0x000b).await?;
+        self.send_hs(&mut stream, &mut hs, Opcode::EpochFinalize, 0x0006, finalize)
             .await?;
-        let (op, _rid, _payload) = self.recv_verified_frame(&mut stream, &hs).await?;
+        let (op, _rid, _payload) = self.recv_hs(&mut stream, &mut hs).await?;
         if op == Opcode::ErrorResponse {
             let err = ErrorResponse::decode(&_payload)?;
             return Err(NexxusError::Io(format!(
@@ -992,7 +1060,10 @@ impl P2pNetwork {
             // Ed25519 pubkey of the peer on this connection, learned from a
             // verified NodeAnnounce. Every later frame must verify against it.
             let mut peer_key: Option<VerifyingKey> = None;
-            let mut peer_nonce: Option<[u8; 32]> = None;
+            // P0-4: наше направление подписываем сначала raw our_nonce (announce, seq 0),
+            // после announce — combined session nonce со счётчиком.
+            let mut tx = TxCrypto { nonce: our_nonce, seq: 0 };
+            let mut rx: Option<RxCrypto> = None;
             // NET-01: incomplete handshakes are dropped after HANDSHAKE_TIMEOUT.
             // H-8: per-connection inbound token bucket (anti single-peer starvation).
             let conn_rl = self.conn_rl.clone();
@@ -1027,7 +1098,7 @@ impl P2pNetwork {
                             // и обнаруживает мёртвого пира по ошибке записи.
                             self.metrics.keepalives_sent.fetch_add(1, Ordering::Relaxed);
                             let ping = nexxus_core::wire::payloads::Ping;
-                            match self.send_signed_frame(&mut stream, &our_nonce, Opcode::Ping, rand::random::<u32>(), &ping).await {
+                            match self.send_signed_frame(&mut stream, &mut tx, Opcode::Ping, rand::random::<u32>(), &ping).await {
                                 Ok(()) => continue,
                                 Err(e) => Err(e),
                             }
@@ -1061,20 +1132,23 @@ impl P2pNetwork {
                     if announce.node_id != expected_node_id {
                         self.metrics.announce_rejected.fetch_add(1, Ordering::Relaxed);
                         let err = ErrorResponse { code: 0x0008, message: "H-3: node_id does not match SHA256(pubkey)".into() };
-                        self.send_signed_frame(&mut stream, &our_nonce, Opcode::ErrorResponse, req_id, &err).await?;
+                        self.send_signed_frame(&mut stream, &mut tx, Opcode::ErrorResponse, req_id, &err).await?;
                         return Err(NexxusError::Io("H-3: node_id does not match SHA256(pubkey)".into()));
                     }
                     let vk = VerifyingKey::from_bytes(&announce.pubkey)
                         .map_err(|e| NexxusError::Io(format!("bad announce pubkey: {e}")))?;
-                    let msg = v3_signing_bytes(opcode, req_id, &payload, &announce.session_nonce);
+                    // P0-4: announce проверяем со счётчиком seq=0
+                    let msg = v3_signing_bytes_seq(opcode, req_id, &payload, &announce.session_nonce, 0);
                     if !Identity::verify(&vk, &msg, &sig) {
                         self.metrics.announce_rejected.fetch_add(1, Ordering::Relaxed);
                         let err = ErrorResponse { code: 0x0008, message: "bad announce signature".into() };
-                        self.send_signed_frame(&mut stream, &our_nonce, Opcode::ErrorResponse, req_id, &err).await?;
+                        self.send_signed_frame(&mut stream, &mut tx, Opcode::ErrorResponse, req_id, &err).await?;
                         return Err(NexxusError::Io("bad announce signature".into()));
                     }
                     peer_key = Some(vk);
-                    peer_nonce = Some(announce.session_nonce);
+                    // P0-4: после announce обе стороны переключаются на combined nonce
+                    let session = combined_session_nonce(&our_nonce, &announce.session_nonce);
+                    rx = Some(RxCrypto { nonce: session, seq: 1 }); // announce был seq 0
                     let their_id = NodeId(announce.node_id);
                     // NET-03 / RES-05: peer cap. If the table is full and the
                     // announcer is unknown, evict the lowest-score known peer
@@ -1112,7 +1186,7 @@ impl P2pNetwork {
                                 drop(routing);
                                 self.metrics.peers_rejected_full.fetch_add(1, Ordering::Relaxed);
                                 let err = ErrorResponse { code: 0x0009, message: "peer table full".into() };
-                                self.send_signed_frame(&mut stream, &our_nonce, Opcode::ErrorResponse, req_id, &err).await?;
+                                self.send_signed_frame(&mut stream, &mut tx, Opcode::ErrorResponse, req_id, &err).await?;
                                 return Err(NexxusError::Io("peer table full".into()));
                             }
                         }
@@ -1128,30 +1202,35 @@ impl P2pNetwork {
                         api.register_peer(addr_clone, Some(their_id), "inbound").await;
                     }
                     let our_announce = self.our_announce(our_nonce);
-                    self.send_signed_frame(&mut stream, &our_nonce, Opcode::NodeAnnounce, req_id, &our_announce).await?;
+                    // announce-ответ: raw our_nonce, seq 0 (peer ещё не знает combined)
+                    self.send_signed_frame(&mut stream, &mut tx, Opcode::NodeAnnounce, req_id, &our_announce).await?;
+                    // теперь наше направление — combined session nonce
+                    tx.nonce = combined_session_nonce(&our_nonce, &announce.session_nonce);
                     continue;
                 }
                 // All non-announce frames require a verified announce first and
                 // a valid signature from the announced key, verified with the
                 // peer's per-connection session nonce from its announce.
-                let (vk, pnonce) = match (peer_key, peer_nonce) {
-                    (Some(vk), Some(n)) => (vk, n),
+                let (vk, rx_crypto) = match (peer_key, &mut rx) {
+                    (Some(vk), Some(r)) => (vk, r),
                     _ => {
                         let err = ErrorResponse {
                             code: 0x0006,
                             message: "unknown peer: send NodeAnnounce first".into(),
                         };
-                        self.send_signed_frame(&mut stream, &our_nonce, Opcode::ErrorResponse, req_id, &err).await?;
+                        self.send_signed_frame(&mut stream, &mut tx, Opcode::ErrorResponse, req_id, &err).await?;
                         continue;
                     }
                 };
-                let msg = v3_signing_bytes(opcode, req_id, &payload, &pnonce);
+                // P0-4: combined nonce + ожидаемый recv_seq — replay всей сессии отклоняется
+                let msg = v3_signing_bytes_seq(opcode, req_id, &payload, &rx_crypto.nonce, rx_crypto.seq);
                 if !Identity::verify(&vk, &msg, &sig) {
-                    let err = ErrorResponse { code: 0x0008, message: "bad frame signature".into() };
-                    self.send_signed_frame(&mut stream, &our_nonce, Opcode::ErrorResponse, req_id, &err).await?;
-                    return Err(NexxusError::Io("bad frame signature".into()));
+                    let err = ErrorResponse { code: 0x0008, message: "bad frame signature or replayed seq".into() };
+                    self.send_signed_frame(&mut stream, &mut tx, Opcode::ErrorResponse, req_id, &err).await?;
+                    return Err(NexxusError::Io("bad frame signature or replayed seq".into()));
                 }
-                self.handle_opcode(&mut stream, &our_nonce, opcode, req_id, &payload, addr).await?;
+                rx_crypto.seq = rx_crypto.seq.wrapping_add(1);
+                self.handle_opcode(&mut stream, &mut tx, opcode, req_id, &payload, addr).await?;
             }
         }).await;
         if let Some(api) = api_clone.lock().await.as_ref() {
@@ -1163,7 +1242,7 @@ impl P2pNetwork {
     async fn handle_opcode<S>(
         &self,
         stream: &mut S,
-        our_nonce: &[u8; 32],
+        tx: &mut TxCrypto,
         opcode: Opcode,
         request_id: u32,
         payload: &[u8],
@@ -1177,14 +1256,14 @@ impl P2pNetwork {
         if self.is_paused() {
             self.metrics.pause_rejections.fetch_add(1, Ordering::Relaxed);
             let err = ErrorResponse { code: 0x0007, message: "node paused".into() };
-            self.send_signed_frame(stream, our_nonce, Opcode::ErrorResponse, request_id, &err).await?;
+            self.send_signed_frame(stream, tx, Opcode::ErrorResponse, request_id, &err).await?;
             return Ok(());
         }
         match opcode {
             Opcode::Ping => {
                 let _ping = nexxus_core::wire::payloads::Ping::decode(payload)?;
                 let pong = nexxus_core::wire::payloads::Pong;
-                self.send_signed_frame(stream, our_nonce, Opcode::Pong, request_id, &pong).await?;
+                self.send_signed_frame(stream, tx, Opcode::Pong, request_id, &pong).await?;
             }
             Opcode::Pong => {
                 // unsolicited pong: nothing to do
@@ -1197,7 +1276,7 @@ impl P2pNetwork {
                 let chunk = StoreChunk::decode(payload)?;
                 self.store.put_chunk(&chunk.chunk_hash, &chunk.data)?;
                 let ack = StoreChunkAck { hash: chunk.chunk_hash.0 };
-                self.send_signed_frame(stream, our_nonce, Opcode::StoreChunkAck, request_id, &ack).await?;
+                self.send_signed_frame(stream, tx, Opcode::StoreChunkAck, request_id, &ack).await?;
             }
             Opcode::StoreChunkAck => {
                 // inbound ack handled by request originator in Phase 8
@@ -1212,7 +1291,7 @@ impl P2pNetwork {
                         chunk_hash: hash,
                         data,
                     };
-                    self.send_signed_frame(stream, our_nonce, Opcode::FetchChunkResp, request_id, &resp).await?;
+                    self.send_signed_frame(stream, tx, Opcode::FetchChunkResp, request_id, &resp).await?;
                 } else {
                     self.metrics.fetch_miss.fetch_add(1, Ordering::Relaxed);
                     self.note_peer_result(peer_addr, false);
@@ -1220,7 +1299,7 @@ impl P2pNetwork {
                         code: 0x0002,
                         message: "chunk not found".into(),
                     };
-                    self.send_signed_frame(stream, our_nonce, Opcode::ErrorResponse, request_id, &err).await?;
+                    self.send_signed_frame(stream, tx, Opcode::ErrorResponse, request_id, &err).await?;
                 }
             }
             Opcode::FetchChunkResp => {
@@ -1239,7 +1318,7 @@ impl P2pNetwork {
                         code: 0x0003,
                         message: "no chunks stored for PoR".into(),
                     };
-                    self.send_signed_frame(stream, our_nonce, Opcode::ErrorResponse, request_id, &err)
+                    self.send_signed_frame(stream, tx, Opcode::ErrorResponse, request_id, &err)
                         .await?;
                 } else {
                     // Детерминированный выбор: индекс = первые 4 байта seed modulo количество чанков.
@@ -1259,7 +1338,7 @@ impl P2pNetwork {
                             chunk_hash: hash,
                             response,
                         };
-                        self.send_signed_frame(stream, our_nonce, Opcode::PorResponse, request_id, &resp)
+                        self.send_signed_frame(stream, tx, Opcode::PorResponse, request_id, &resp)
                             .await?;
                     } else {
                         self.metrics.por_fail.fetch_add(1, Ordering::Relaxed);
@@ -1268,7 +1347,7 @@ impl P2pNetwork {
                             code: 0x0003,
                             message: "chunk not found for PoR".into(),
                         };
-                        self.send_signed_frame(stream, our_nonce, Opcode::ErrorResponse, request_id, &err)
+                        self.send_signed_frame(stream, tx, Opcode::ErrorResponse, request_id, &err)
                             .await?;
                     }
                 }
@@ -1287,7 +1366,7 @@ impl P2pNetwork {
                     .map(|p| socket_addr_to_kad_peer(&p))
                     .collect();
                 let nodes = KadNodesFound { peers: kad_peers };
-                self.send_signed_frame(stream, our_nonce, Opcode::KadNodesFound, request_id, &nodes).await?;
+                self.send_signed_frame(stream, tx, Opcode::KadNodesFound, request_id, &nodes).await?;
             }
             Opcode::KadNodesFound => {
                 // inbound nodes found handled by request originator in Phase 8
@@ -1307,14 +1386,14 @@ impl P2pNetwork {
                             let _ = tx.send(msg);
                         }
                         let pong = nexxus_core::wire::payloads::Pong;
-                        self.send_signed_frame(stream, our_nonce, Opcode::Pong, request_id, &pong).await?;
+                        self.send_signed_frame(stream, tx, Opcode::Pong, request_id, &pong).await?;
                     }
                     Err(_) => {
                         let err = ErrorResponse {
                             code: 0x0004,
                             message: "smp envelope decrypt failed".into(),
                         };
-                        self.send_signed_frame(stream, our_nonce, Opcode::ErrorResponse, request_id, &err).await?;
+                        self.send_signed_frame(stream, tx, Opcode::ErrorResponse, request_id, &err).await?;
                     }
                 }
             }
@@ -1348,14 +1427,14 @@ impl P2pNetwork {
                         );
                         let _ = self.store.put_meta("last_epoch", record.as_bytes());
                         let pong = nexxus_core::wire::payloads::Pong;
-                        self.send_signed_frame(stream, our_nonce, Opcode::Pong, request_id, &pong).await?;
+                        self.send_signed_frame(stream, tx, Opcode::Pong, request_id, &pong).await?;
                     }
                     _ => {
                         let err = ErrorResponse {
                             code: 0x0005,
                             message: "epoch finalize multi-sig verification failed".into(),
                         };
-                        self.send_signed_frame(stream, our_nonce, Opcode::ErrorResponse, request_id, &err)
+                        self.send_signed_frame(stream, tx, Opcode::ErrorResponse, request_id, &err)
                             .await?;
                     }
                 }
@@ -1393,10 +1472,10 @@ impl P2pNetwork {
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| NexxusError::Io(e.to_string()))?;
-        let hs = self.announce_handshake(&mut stream, 0x0001).await?;
-        self.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::Ping, 0x0002, &nexxus_core::wire::payloads::Ping)
+        let mut hs = self.announce_handshake(&mut stream, 0x0001).await?;
+        self.send_hs(&mut stream, &mut hs, Opcode::Ping, 0x0002, &nexxus_core::wire::payloads::Ping)
             .await?;
-        let (op, _rid, _payload) = self.recv_req_frame(&mut stream, &hs).await?;
+        let (op, _rid, _payload) = self.recv_req_frame(&mut stream, &mut hs).await?;
         if op != Opcode::Pong {
             return Err(NexxusError::Io(format!(
                 "expected Pong, got opcode 0x{:02x}",
@@ -1418,12 +1497,12 @@ impl P2pNetwork {
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| NexxusError::Io(e.to_string()))?;
-        let hs = self.announce_handshake(&mut stream, 0x0011).await?;
+        let mut hs = self.announce_handshake(&mut stream, 0x0011).await?;
         let seed: [u8; 32] = rand::random();
         let challenge = PorChallenge { seed, count: 1, deadline_ms: 5000 };
-        self.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::PorChallenge, 0x0012, &challenge)
+        self.send_hs(&mut stream, &mut hs, Opcode::PorChallenge, 0x0012, &challenge)
             .await?;
-        let (op, _rid, payload) = self.recv_req_frame(&mut stream, &hs).await?;
+        let (op, _rid, payload) = self.recv_req_frame(&mut stream, &mut hs).await?;
         let (ok, detail) = match op {
             Opcode::PorResponse => {
                 let resp = PorResponse::decode(&payload)
@@ -1469,10 +1548,10 @@ impl P2pNetwork {
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| NexxusError::Io(e.to_string()))?;
-        let hs = self.announce_handshake(&mut stream, 0x0004).await?;
-        self.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::StoreChunk, 0x0003, chunk)
+        let mut hs = self.announce_handshake(&mut stream, 0x0004).await?;
+        self.send_hs(&mut stream, &mut hs, Opcode::StoreChunk, 0x0003, chunk)
             .await?;
-        let (op, _rid, payload) = self.recv_verified_frame(&mut stream, &hs).await?;
+        let (op, _rid, payload) = self.recv_hs(&mut stream, &mut hs).await?;
         match op {
             Opcode::StoreChunkAck => {
                 let ack = nexxus_core::wire::payloads::StoreChunkAck::decode(&payload)?;
@@ -1615,7 +1694,7 @@ mod tests {
 
         // connect a client, announce, then StoreChunk -> FetchChunk
         let mut stream = TcpStream::connect(listener_addr).await.unwrap();
-        let hs = net.announce_handshake(&mut stream, 0x0009).await.unwrap();
+        let mut hs = net.announce_handshake(&mut stream, 0x0009).await.unwrap();
         let data: Vec<u8> = (0..500).map(|i| (i % 251) as u8).collect();
         let hash = h(&data);
         let chunk = StoreChunk {
@@ -1624,13 +1703,13 @@ mod tests {
             chunk_index: 0,
             data: data.clone(),
         };
-        net.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::StoreChunk, 0x0001, &chunk).await.unwrap();
+        net.send_hs(&mut stream, &mut hs, Opcode::StoreChunk, 0x0001, &chunk).await.unwrap();
         let (op, rid, _payload, _sig) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
         assert_eq!(op, Opcode::StoreChunkAck);
         assert_eq!(rid, 0x0001);
 
         let fetch = FetchChunk { hash: hash.0 };
-        net.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::FetchChunk, 0x0002, &fetch).await.unwrap();
+        net.send_hs(&mut stream, &mut hs, Opcode::FetchChunk, 0x0002, &fetch).await.unwrap();
         let (op2, rid2, payload2, _sig2) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
         assert_eq!(op2, Opcode::FetchChunkResp);
         assert_eq!(rid2, 0x0002);
@@ -1639,7 +1718,7 @@ mod tests {
 
         // E1: a second fetch of a missing hash records hit+miss and peer score.
         let miss = FetchChunk { hash: [0xEEu8; 32] };
-        net.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::FetchChunk, 0x0003, &miss).await.unwrap();
+        net.send_hs(&mut stream, &mut hs, Opcode::FetchChunk, 0x0003, &miss).await.unwrap();
         let (op3, _, _, _) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
         assert_eq!(op3, Opcode::ErrorResponse);
         // let the server task process the frames before asserting counters
@@ -1775,15 +1854,13 @@ mod tests {
 
         // client announces, then sends PorChallenge with seed = chunk hash
         let mut stream = TcpStream::connect(listener_addr).await.unwrap();
-        let hs = net.announce_handshake(&mut stream, 0x0009).await.unwrap();
+        let mut hs = net.announce_handshake(&mut stream, 0x0009).await.unwrap();
         let challenge = PorChallenge {
             seed: hash.0,
             count: 1,
             deadline_ms: 5000,
         };
-        net.send_signed_frame(
-            &mut stream,
-            &hs.our_nonce,
+        net.send_hs(&mut stream, &mut hs,
             Opcode::PorChallenge,
             0x0007,
             &challenge,
@@ -1885,8 +1962,8 @@ mod tests {
         };
 
         let mut stream = TcpStream::connect(listener_addr).await.unwrap();
-        let hs = net.announce_handshake(&mut stream, 0x0009).await.unwrap();
-        net.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::EpochFinalize, 0x0008, &finalize)
+        let mut hs = net.announce_handshake(&mut stream, 0x0009).await.unwrap();
+        net.send_hs(&mut stream, &mut hs, Opcode::EpochFinalize, 0x0008, &finalize)
             .await
             .unwrap();
         let (op, _rid, _payload, _sig) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
@@ -1937,8 +2014,8 @@ mod tests {
         };
 
         let mut stream = TcpStream::connect(listener_addr).await.unwrap();
-        let hs = net.announce_handshake(&mut stream, 0x0009).await.unwrap();
-        net.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::EpochFinalize, 0x0008, &finalize)
+        let mut hs = net.announce_handshake(&mut stream, 0x0009).await.unwrap();
+        net.send_hs(&mut stream, &mut hs, Opcode::EpochFinalize, 0x0008, &finalize)
             .await
             .unwrap();
         let (op, _rid, _payload, _sig) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
@@ -2110,13 +2187,36 @@ mod tests {
         let (net, listener_addr, server) = spawn_bound(0x51).await;
         // Ping without prior NodeAnnounce must be rejected with 0x0006
         let mut stream = TcpStream::connect(listener_addr).await.unwrap();
-        net.send_signed_frame(&mut stream, &[0u8; 32], Opcode::Ping, 0x0001, &nexxus_core::wire::payloads::Ping)
+        net.send_signed_frame(&mut stream, &mut TxCrypto { nonce: [0u8; 32], seq: 0 }, Opcode::Ping, 0x0001, &nexxus_core::wire::payloads::Ping)
             .await
             .unwrap();
         let (op, _rid, payload, _sig) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
         assert_eq!(op, Opcode::ErrorResponse);
         let err = ErrorResponse::decode(&payload).unwrap();
         assert_eq!(err.code, 0x0006);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn p0_4_replayed_frame_seq_is_rejected() {
+        // P0-4 регрессионный тест: кадр, проигранный повторно с тем же seq,
+        // отклоняется (replay всей записанной сессии не проходит).
+        let (net, listener_addr, server) = spawn_bound(0x53).await;
+        let mut stream = TcpStream::connect(listener_addr).await.unwrap();
+        let mut hs = net.announce_handshake(&mut stream, 0x0001).await.unwrap();
+        // валидный Ping (уйдёт с send_seq, server примет)
+        net.send_hs(&mut stream, &mut hs, Opcode::Ping, 0x0002, &nexxus_core::wire::payloads::Ping).await.unwrap();
+        let (op, _rid, _payload) = net.recv_hs(&mut stream, &mut hs).await.unwrap();
+        assert_eq!(op, Opcode::Pong);
+        // replay: тот же кадр с ТЕМ ЖЕ seq (откатываем счётчик и шлём идентичный Ping)
+        let saved_seq = hs.send_seq;
+        let mut replay_tx = TxCrypto { nonce: hs.session_nonce, seq: saved_seq - 1 };
+        net.send_signed_frame(&mut stream, &mut replay_tx, Opcode::Ping, 0x0002, &nexxus_core::wire::payloads::Ping).await.unwrap();
+        // server должен ответить 0x0008 (bad signature/replay), а не Pong
+        let (op, _rid, payload, _sig) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
+        assert_eq!(op, Opcode::ErrorResponse);
+        let err = ErrorResponse::decode(&payload).unwrap();
+        assert_eq!(err.code, 0x0008);
         server.abort();
     }
 
@@ -2149,23 +2249,23 @@ mod tests {
     async fn pause_blocks_frames_and_resume_restores() {
         let (net, listener_addr, server) = spawn_bound(0x53).await;
         let mut stream = TcpStream::connect(listener_addr).await.unwrap();
-        let hs = net.announce_handshake(&mut stream, 0x0001).await.unwrap();
+        let mut hs = net.announce_handshake(&mut stream, 0x0001).await.unwrap();
         let ping = nexxus_core::wire::payloads::Ping;
         // normal ping -> pong
-        net.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::Ping, 0x0002, &ping).await.unwrap();
+        net.send_hs(&mut stream, &mut hs, Opcode::Ping, 0x0002, &ping).await.unwrap();
         let (op, _, _, _) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
         assert_eq!(op, Opcode::Pong);
         // pause -> ping rejected with 0x0007
         net.set_paused(true);
         assert!(net.is_paused());
-        net.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::Ping, 0x0003, &ping).await.unwrap();
+        net.send_hs(&mut stream, &mut hs, Opcode::Ping, 0x0003, &ping).await.unwrap();
         let (op, _, payload, _) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
         assert_eq!(op, Opcode::ErrorResponse);
         assert_eq!(ErrorResponse::decode(&payload).unwrap().code, 0x0007);
         // resume -> pong again
         net.set_paused(false);
         assert!(!net.is_paused());
-        net.send_signed_frame(&mut stream, &hs.our_nonce, Opcode::Ping, 0x0004, &ping).await.unwrap();
+        net.send_hs(&mut stream, &mut hs, Opcode::Ping, 0x0004, &ping).await.unwrap();
         let (op, _, _, _) = crate::net::frame::recv_frame_rl(&mut stream, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
         assert_eq!(op, Opcode::Pong);
         server.abort();
@@ -2219,22 +2319,22 @@ mod tests {
         // signed with the nonce of ANOTHER connection must be rejected (0x0008).
         let (net, addr, server) = spawn_bound(0x71).await;
         let mut s1 = TcpStream::connect(addr).await.unwrap();
-        let hs1 = net.announce_handshake(&mut s1, 0x0001).await.unwrap();
+        let mut hs1 = net.announce_handshake(&mut s1, 0x0001).await.unwrap();
         let mut s2 = TcpStream::connect(addr).await.unwrap();
-        let hs2 = net.announce_handshake(&mut s2, 0x0001).await.unwrap();
+        let mut hs2 = net.announce_handshake(&mut s2, 0x0001).await.unwrap();
         // per-connection nonces differ on both sides
-        assert_ne!(hs1.our_nonce, hs2.our_nonce);
-        assert_ne!(hs1.peer_nonce, hs2.peer_nonce);
+        assert_ne!(hs1.session_nonce, hs2.session_nonce);
+        assert_ne!(hs1.session_nonce, hs2.session_nonce); // разные соединения — разные combined nonce
 
         // valid ping on s2 works
-        net.send_signed_frame(&mut s2, &hs2.our_nonce, Opcode::Ping, 0x0002, &nexxus_core::wire::payloads::Ping)
+        net.send_hs(&mut s2, &mut hs2, Opcode::Ping, 0x0002, &nexxus_core::wire::payloads::Ping)
             .await
             .unwrap();
         let (op, _, _, _) = crate::net::frame::recv_frame_rl(&mut s2, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
         assert_eq!(op, Opcode::Pong);
 
         // replay: same key, but signed with s1's nonce, sent over s2 -> 0x0008
-        net.send_signed_frame(&mut s2, &hs1.our_nonce, Opcode::Ping, 0x0003, &nexxus_core::wire::payloads::Ping)
+        net.send_hs(&mut s2, &mut hs1, Opcode::Ping, 0x0003, &nexxus_core::wire::payloads::Ping)
             .await
             .unwrap();
         let (op, _, payload, _) = crate::net::frame::recv_frame_rl(&mut s2, &crate::net::ratelimit::RateLimit::NONE).await.unwrap();
