@@ -61,11 +61,11 @@ ADR-0011 (`docs/adr/0011-wire-v4.md`) — дизайн wire v4, вопросы �
 | P1-3 accept/limits | **закрыт** | `a511b39`: backoff при ошибке accept (v3+v4), GC `ip_limits`, IPv6 группируется по /64 |
 | P1-4 smp_inbox unbounded | **закрыт** | `a511b39`: bounded channel(1024), дроп при переполнении + метрика `smp_dropped` |
 | P0-3 vault v3 (Argon2id, ≥10 символов, decoy) | **частично** | C-9 закрыт ранее; полный v3-формат с пароль-фразой — следующий цикл |
-| P0-7 update.rs vs CI minisign | **открыт** | фаза 3 |
+| P0-7 update.rs vs CI minisign | **закрыт** | `bf88dee`: self-update на minisign SHA256SUMS-манифесте (тот же pubkey, что в CI) + sha256 ассета по манифесту + semver anti-rollback; тест `p0_7_manifest_parsing_and_semver` |
 | P1-5 wire-v4 по умолчанию | **открыт** | mixed-mode/auto-upgrade — следующий цикл |
-| P1-9 роли токена API | **открыт** | фаза 1 остаток |
+| P1-9 роли токена API | **закрыт** | `226df2b`: admin (`~/.nexxus/api.token`) + read-only (`~/.nexxus/api.token.read`, 0600, env NEXXUS_API_TOKEN_READ_FILE); read-роль: только мониторинг-методы + /metrics, ct_eq; мутации отклоняются; тест `p1_9_read_token_allows_read_rejects_mutation` |
 | P1-10 потоковый upload/download | **открыт** | фаза 4 |
 | P1-11/12 CI (deny, SBOM, SHA-пин) | **открыт** | фаза 3 |
 | P1-14 один UI/демон, archive | **открыт** | фаза 5 |
 
-Гейты на `a511b39`: `cargo test -p nexxus-node --features wire-v4` 0 failed; `cargo clippy -p nexxus-node --all-targets -- -D warnings` 0 ошибок; `check-tree-hygiene.sh` чист.
+Гейты на `226df2b`: `cargo test -p nexxus-node --features wire-v4` 0 failed; `cargo clippy -p nexxus-node --all-targets -- -D warnings` 0 ошибок; `check-tree-hygiene.sh` чист.
