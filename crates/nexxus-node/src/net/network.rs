@@ -784,6 +784,12 @@ impl P2pNetwork {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let pro = nz::prologue(&self.node_id(), &NodeId([0u8; 32]), 0);
         let mut hs = nz::responder_start(&self.x25519_secret, &pro).map_err(NexxusError::Io)?;
+        // v4 magic (P1-5 mixed-mode sniffing на одном порту)
+        let mut magic = [0u8; 4];
+        stream.read_exact(&mut magic).await.map_err(|e| NexxusError::Io(e.to_string()))?;
+        if &magic != b"NXV4" {
+            return Err(NexxusError::Io("bad v4 magic".into()));
+        }
         // msg1 (e) — plaintext, но в u32-len кадре
         let mut lenb = [0u8; 4];
         stream.read_exact(&mut lenb).await.map_err(|e| NexxusError::Io(e.to_string()))?;
@@ -822,6 +828,7 @@ impl P2pNetwork {
         let mut stream = TcpStream::connect(addr).await.map_err(|e| NexxusError::Io(e.to_string()))?;
         let pro = nz::prologue(&self.node_id(), &NodeId([0u8; 32]), 0);
         let (mut hs, msg1) = nz::initiator_start(&self.x25519_secret, &pro).map_err(NexxusError::Io)?;
+        stream.write_all(b"NXV4").await.map_err(|e| NexxusError::Io(e.to_string()))?;
         stream.write_all(&(msg1.len() as u32).to_be_bytes()).await.map_err(|e| NexxusError::Io(e.to_string()))?;
         stream.write_all(&msg1).await.map_err(|e| NexxusError::Io(e.to_string()))?;
         let mut lenb = [0u8; 4];
@@ -903,6 +910,45 @@ impl P2pNetwork {
                     node_id: None,
                     addr,
                 };
+                // P1-5: mixed-mode на одном порту — sniff первых 4 байтов.
+                // v4 handshake начинается с magic b"NXV4" (u32 0x4E585634 как v3 frame len — 1.3 ГБ, > MAX_FRAME_LEN, коллизий нет).
+                // NEXXUS_P2P_V4_SNIFF=0 отключает sniffing (чистый v3).
+                #[cfg(feature = "wire-v4")]
+                {
+                    let sniff = std::env::var("NEXXUS_P2P_V4_SNIFF").map(|v| v != "0").unwrap_or(true);
+                    if sniff {
+                        let mut buf = [0u8; 4];
+                        // тот же HANDSHAKE_TIMEOUT, что и на первый v3 frame: тихие соединения дропаются сразу
+                        let peeked = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut buf)).await;
+                        match peeked {
+                            Ok(Ok(n)) if n >= 4 && &buf == b"NXV4" => {
+                                crate::log_ev!("info", "conn.v4.sniffed", "addr" => addr.to_string());
+                                if let Err(e) = net.handle_v4_conn(stream, addr).await {
+                                    crate::log_ev!("warn", "v4.conn.err", "err" => e.to_string());
+                                }
+                                if let Ok(mut limits) = net.ip_limits.lock() {
+                                    if let Some(b) = limits.get_mut(&addr.ip()) {
+                                        b.active = b.active.saturating_sub(1);
+                                    }
+                                }
+                                return;
+                            }
+                            // таймаут peek: соединение ничего не прислало за HANDSHAKE_TIMEOUT — дропаем сразу,
+                            // не дожидаясь второго таймаута в v3-обработчике
+                            Err(_elapsed) => {
+                                net.metrics.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+                                crate::log_ev!("warn", "handshake.timeout", "addr" => addr.to_string());
+                                if let Ok(mut limits) = net.ip_limits.lock() {
+                                    if let Some(b) = limits.get_mut(&addr.ip()) {
+                                        b.active = b.active.saturating_sub(1);
+                                    }
+                                }
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if let Err(e) = net.handle_connection(stream, peer).await {
                     let _ = e;
                 }
@@ -2484,5 +2530,21 @@ mod tests {
         net.dial_v4_ping(format!("127.0.0.1:{port}").parse().unwrap()).await.unwrap();
         server.abort();
         v4.abort();
+    }
+
+    // P1-5: mixed-mode — v4-диал на ОСНОВНОЙ порт (run) должен быть sniff'нут как v4.
+    #[cfg(feature = "wire-v4")]
+    #[tokio::test]
+    async fn v4_dial_to_main_port_is_sniffed() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ChunkStore::open(dir.path().join("store.redb")).unwrap());
+        let our_id = NodeId([0x44u8; 32]);
+        let net = Arc::new(P2pNetwork::new(our_id, "127.0.0.1:0".parse().unwrap(), store));
+        let net_clone = Arc::clone(&net);
+        let server = tokio::spawn(async move { net_clone.run().await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let bound = net.bound_addr.lock().await.expect("bound");
+        net.dial_v4_ping(bound).await.unwrap();
+        server.abort();
     }
 }
