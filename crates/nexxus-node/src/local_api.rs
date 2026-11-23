@@ -178,8 +178,9 @@ pub struct LocalApi {
     smp_history: Arc<Mutex<Vec<SmpMessageInfo>>>,
     /// Inbound SMP channel: sender side goes to P2pNetwork, receiver is
     /// drained into smp_history by a task spawned in run().
-    smp_inbox_tx: mpsc::UnboundedSender<InboundSmp>,
-    smp_inbox_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<InboundSmp>>>>,
+    /// P1-4: bounded (1024) — переполнение дропается в network, не растёт память.
+    smp_inbox_tx: mpsc::Sender<InboundSmp>,
+    smp_inbox_rx: Arc<Mutex<Option<mpsc::Receiver<InboundSmp>>>>,
     /// Статус финализации эпохи (кворум, merkle_root и т.д.).
     epoch_info: Arc<Mutex<EpochInfo>>,
     /// Статус Tor (включен, onion адрес, подключён).
@@ -293,7 +294,7 @@ fn auth_gate(
 
 impl LocalApi {
     pub fn new(network: Arc<P2pNetwork>, store: Arc<ChunkStore>) -> Self {
-        let (smp_inbox_tx, smp_inbox_rx) = mpsc::unbounded_channel();
+        let (smp_inbox_tx, smp_inbox_rx) = mpsc::channel(1024);
         let panic_path = crate::panic::PanicManager::default_path(store.path());
         Self {
             network,

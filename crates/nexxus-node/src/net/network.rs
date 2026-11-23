@@ -125,7 +125,8 @@ pub struct P2pNetwork {
     /// (driven by local API node_pause/node_resume).
     paused: Arc<AtomicBool>,
     /// Inbound SMP inbox (attached by LocalApi): decrypted envelopes land here.
-    smp_inbox: Arc<Mutex<Option<mpsc::UnboundedSender<InboundSmp>>>>,
+    /// P1-4: bounded channel (1024) — переполнение дропает, а не роняет память.
+    smp_inbox: Arc<Mutex<Option<mpsc::Sender<InboundSmp>>>>,
     /// Global cap on concurrently handled inbound connections (NET-01:
     /// bounds memory/CPU spent on signature verifies).
     conn_sem: Arc<tokio::sync::Semaphore>,
@@ -144,10 +145,16 @@ pub struct P2pNetwork {
 }
 
 /// Per-IP connection bucket: active connections + timestamps of recent accepts.
-#[derive(Default)]
 struct IpBucket {
+    last_seen: std::time::Instant,
     active: usize,
     recent: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl Default for IpBucket {
+    fn default() -> Self {
+        Self { active: 0, recent: std::collections::VecDeque::new(), last_seen: std::time::Instant::now() }
+    }
 }
 
 /// E1 observability: process-level counters, exposed via `node_metrics`
@@ -174,6 +181,8 @@ pub struct Metrics {
     pub peers_evicted: AtomicU64,
     /// E1 loss-индикатор: клиентские запросы (ping/fetch/por), истёкшие по таймауту.
     pub req_timeouts: AtomicU64,
+    /// P1-4: дропнутые SMP при переполнении bounded inbox.
+    pub smp_dropped: AtomicU64,
     /// F1: суммарное время, проведённое в дросселе bandwidth cap (мс).
     pub rl_wait_ms: AtomicU64,
     /// H-4: отправлено keepalive-ping'ов ( liveness established-соединений).
@@ -202,6 +211,7 @@ impl Metrics {
             "backup_fail": self.backup_fail.load(Ordering::Relaxed),
             "peers_evicted": self.peers_evicted.load(Ordering::Relaxed),
             "req_timeouts": self.req_timeouts.load(Ordering::Relaxed),
+            "smp_dropped": self.smp_dropped.load(Ordering::Relaxed),
             "rl_wait_ms": self.rl_wait_ms.load(Ordering::Relaxed),
             "keepalives_sent": self.keepalives_sent.load(Ordering::Relaxed),
         })
@@ -525,7 +535,7 @@ impl P2pNetwork {
     }
 
     /// Attach the inbound SMP channel (LocalApi drains it into smp_history).
-    pub async fn set_smp_inbox(&self, tx: mpsc::UnboundedSender<InboundSmp>) {
+    pub async fn set_smp_inbox(&self, tx: mpsc::Sender<InboundSmp>) {
         *self.smp_inbox.lock().await = Some(tx);
     }
 
@@ -747,7 +757,15 @@ impl P2pNetwork {
         let bound = listener.local_addr().map_err(|e| NexxusError::Io(e.to_string()))?;
         crate::log_ev!("info", "v4.listen", "addr" => bound.to_string());
         loop {
-            let (stream, peer_addr) = listener.accept().await.map_err(|e| NexxusError::Io(e.to_string()))?;
+            // P1-3: backoff при ошибке accept
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("nexxusd P2P v4: accept error: {e} — backoff 1s");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
             self.metrics.conns_accepted.fetch_add(1, Ordering::Relaxed);
             let net = Arc::clone(&self);
             task::spawn(async move {
@@ -839,17 +857,32 @@ impl P2pNetwork {
         let bound = listener.local_addr().map_err(|e| NexxusError::Io(e.to_string()))?;
         *self.bound_addr.lock().await = Some(bound);
         loop {
-            let (stream, addr) = listener
-                .accept()
-                .await
-                .map_err(|e| NexxusError::Io(e.to_string()))?;
+            // P1-3: ошибка accept (EMFILE и т.п.) — backoff 1s, listener не падает
+            let (stream, addr) = match listener.accept().await {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("nexxusd P2P: accept error: {e} — backoff 1s");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
             self.metrics.conns_accepted.fetch_add(1, Ordering::Relaxed);
             crate::log_ev!("info", "conn.accepted", "addr" => addr.to_string());
             // NET-01: per-IP limits before spawning any work.
             {
                 let mut limits = self.ip_limits.lock().unwrap();
                 let now = std::time::Instant::now();
-                let bucket = limits.entry(addr.ip()).or_default();
+                // P1-3: GC просроченных записей и группировка IPv6 по /64
+                limits.retain(|_, b| b.active > 0 || now.duration_since(b.last_seen) < std::time::Duration::from_secs(300));
+                let key_ip = match addr.ip() {
+                    std::net::IpAddr::V6(v6) => {
+                        let mut seg = v6.segments();
+                        seg[1] = 0; seg[2] = 0; seg[3] = 0; // /64
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(seg))
+                    }
+                    ip => ip,
+                };
+                let bucket = limits.entry(key_ip).or_default();
                 bucket.recent.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(60));
                 if bucket.active >= MAX_ACTIVE_PER_IP
                     || bucket.recent.len() as u64 >= MAX_NEW_PER_IP_PER_MIN
@@ -859,6 +892,7 @@ impl P2pNetwork {
                     continue; // drop the connection silently
                 }
                 bucket.active += 1;
+                bucket.last_seen = now;
                 bucket.recent.push_back(now);
             }
             let net = Arc::clone(&self);
@@ -1382,8 +1416,11 @@ impl P2pNetwork {
                             recipient_node_id: env.recipient_node_id,
                             plaintext,
                         };
+                        // P1-4: try_send — при переполнении (1024) дропаем, метрику растим
                         if let Some(tx) = self.smp_inbox.lock().await.as_ref() {
-                            let _ = tx.send(msg);
+                            if tx.try_send(msg).is_err() {
+                                self.metrics.smp_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         let pong = nexxus_core::wire::payloads::Pong;
                         self.send_signed_frame(stream, tx, Opcode::Pong, request_id, &pong).await?;
@@ -2279,7 +2316,7 @@ mod tests {
         let (net_b, addr_b, server_b) = spawn_bound(0x62).await;
         let _ = addr_a;
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(1024);
         net_b.set_smp_inbox(tx).await;
 
         // A announces to B -> both routing tables learn each other
