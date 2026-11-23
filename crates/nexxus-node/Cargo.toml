@@ -30,6 +30,8 @@ redb = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 rand = { workspace = true }
 argon2 = "0.5"
+minisign-verify = "0.3"
+semver = "1"
 hex = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }

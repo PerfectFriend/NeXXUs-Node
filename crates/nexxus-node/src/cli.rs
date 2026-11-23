@@ -502,18 +502,20 @@ fn cmd_update(rest: &[String]) -> i32 {
         i += 1;
     }
     println!("nexxusd update: downloading {url} …");
-    let (bytes, sig) = match crate::update::download(&url) {
+    // P0-7: ассет + подписанный манифест SHA256SUMS + minisig (как в CI)
+    let asset_name = url.rsplit('/').next().unwrap_or("nexxusd").to_string();
+    let (bytes, manifest, minisig) = match crate::update::download(&url) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("update: download failed: {e}");
             return 1;
         }
     };
-    if let Err(e) = crate::update::verify_release(&bytes, &sig) {
+    if let Err(e) = crate::update::verify_release_manifest(&bytes, &asset_name, &manifest, &minisig) {
         eprintln!("update: {e} — бинарник НЕ заменён");
         return 1;
     }
-    println!("update: signature OK ({} bytes)", bytes.len());
+    println!("update: minisign+SHA256SUMS OK ({} bytes)", bytes.len());
     // UPD-02: anti-rollback — кандидат должен быть строго новее текущей версии.
     match crate::update::check_not_downgrade(&bytes) {
         Ok(v) => println!("update: candidate version {v} > current {} — OK", env!("CARGO_PKG_VERSION")),
@@ -527,7 +529,7 @@ fn cmd_update(rest: &[String]) -> i32 {
         return 0;
     }
     let current = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nexxusd"));
-    match crate::update::install_update(&bytes, &sig, &current) {
+    match crate::update::install_update(&bytes, &asset_name, &manifest, &minisig, &current) {
         Ok(p) => {
             println!("update: installed to {} — перезапустите демон", p.display());
             0

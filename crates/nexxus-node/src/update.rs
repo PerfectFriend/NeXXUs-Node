@@ -8,46 +8,75 @@
 use nexxus_core::error::NexxusError;
 use std::path::{Path, PathBuf};
 
-/// Публичный ключ подписи релизов (ed25519, hex). Приватный — у владельца,
-/// в secrets вне git (см. docs/plans/2026-11-12-evolution-post-rc1.md, фаза G4).
-pub const RELEASE_PUBKEY_HEX: &str =
-    "d2513bc75eb06436ecc391005bf8ad0fba4f6d8d66f4e16bee7039dcc1947436";
+/// P0-7: minisign-публичный ключ релизов (base64, тот же, что в keys/nexxus-release-minisign.pub).
+/// CI подписывает SHA256SUMS манифест — тот же механизм, что и CI (ci-release.yml, H-12).
+pub const RELEASE_MINISIGN_PUBKEY_B64: &str =
+    "RWQBA6hz7o68fUSHH64Tr9OeijSMzDejwteaDL8di3ZrcvJS9kLpGygD";
+
 
 /// URL релизного ассета по умолчанию (squash-mirror / GitHub releases).
 pub const DEFAULT_RELEASE_URL: &str =
     "https://github.com/PerfectFriend/NeXXuS-Node-Hermes-Rust/releases/latest/download/nexxusd-linux-x86_64";
 
-pub fn release_pubkey() -> Result<ed25519_dalek::VerifyingKey, NexxusError> {
-    let bytes = hex::decode(RELEASE_PUBKEY_HEX)
-        .map_err(|e| NexxusError::Io(format!("release pubkey hex: {e}")))?;
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| NexxusError::Io("release pubkey must be 32 bytes".into()))?;
-    ed25519_dalek::VerifyingKey::from_bytes(&arr)
-        .map_err(|e| NexxusError::Io(format!("release pubkey: {e}")))
+
+/// P0-7: верификация релиза через minisign-манифест SHA256SUMS (как в CI).
+/// `manifest` — содержимое SHA256SUMS, `minisig_b64` — SHA256SUMS.minisig,
+/// `asset_name` — имя файла ассета в манифесте (защита от подмены имени).
+pub fn verify_release_manifest(
+    asset_bytes: &[u8],
+    asset_name: &str,
+    manifest: &[u8],
+    minisig_b64: &str,
+) -> Result<(), NexxusError> {
+    use minisign_verify::{PublicKey, Signature};
+    let pk = PublicKey::from_base64(RELEASE_MINISIGN_PUBKEY_B64)
+        .map_err(|e| NexxusError::Io(format!("release minisign pubkey: {e}")))?;
+    let sig = Signature::decode(minisig_b64.trim())
+        .map_err(|e| NexxusError::Io(format!("bad minisig: {e}")))?;
+    pk.verify(manifest, &sig, false)
+        .map_err(|_| NexxusError::Vault("SHA256SUMS minisign verification FAILED".into()))?;
+    // ищем строку манифеста ровно для нашего ассета (имя без путей)
+    let want_name = asset_name.rsplit('/').next().unwrap_or(asset_name);
+    let manifest_str = String::from_utf8_lossy(manifest);
+    let expected = manifest_str
+        .lines()
+        .find_map(|l| {
+            let mut it = l.split_whitespace();
+            let hash = it.next()?;
+            let name = it.next()?.trim_start_matches('*');
+            if name == want_name || name.ends_with(want_name) {
+                Some(hash.to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| NexxusError::Vault(format!("asset {want_name} not found in signed manifest")))?;
+    let actual = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(asset_bytes))
+    };
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(NexxusError::Vault(format!(
+            "sha256 mismatch for {want_name}: manifest {expected} vs actual {actual}"
+        )));
+    }
+    Ok(())
 }
 
-/// Проверка detached-подписи (64 байта) над байтами ассета.
-pub fn verify_release(bytes: &[u8], signature_hex: &str) -> Result<(), NexxusError> {
-    let sig_bytes = hex::decode(signature_hex.trim())
-        .map_err(|e| NexxusError::Io(format!("bad signature hex: {e}")))?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| NexxusError::Io("signature must be 64 bytes".into()))?;
-    let vk = release_pubkey()?;
-    use ed25519_dalek::Verifier;
-    vk.verify(bytes, &ed25519_dalek::Signature::from_bytes(&sig_arr))
-        .map_err(|_| NexxusError::Vault("release signature verification FAILED".into()))
-}
 
-/// UPD-01: скачивание ассета и .sig in-process через ureq+rustls (без curl/PATH).
+/// P0-7: скачивание ассета + подписанного манифеста SHA256SUMS + SHA256SUMS.minisig.
 /// HTTPS обязателен; plain HTTP разрешён только для loopback (локальные тесты).
-pub fn download(url: &str) -> Result<(Vec<u8>, String), NexxusError> {
+pub fn download(url: &str) -> Result<(Vec<u8>, Vec<u8>, String), NexxusError> {
     let bin = http_get(url)?;
-    let sig = http_get(&format!("{url}.sig"))
-        .map_err(|e| NexxusError::Io(format!("signature download: {e}")))?;
-    let sig_text = String::from_utf8_lossy(&sig).trim().to_string();
-    Ok((bin, sig_text))
+    let base = url.rsplit('/').next().unwrap_or("");
+    let manifest_url = format!("{}/SHA256SUMS", &url[..url.len() - base.len()]);
+    let minisig_url = format!("{manifest_url}.minisig");
+    let manifest = http_get(&manifest_url)
+        .map_err(|e| NexxusError::Io(format!("manifest download: {e}")))?;
+    let minisig = http_get(&minisig_url)
+        .map_err(|e| NexxusError::Io(format!("minisig download: {e}")))?;
+    let sig_text = String::from_utf8_lossy(&minisig).trim().to_string();
+    Ok((bin, manifest, sig_text))
 }
 
 /// Валидация URL: https всегда; http только для 127.0.0.1/localhost/[::1].
@@ -155,8 +184,14 @@ pub fn check_not_downgrade(new_bytes: &[u8]) -> Result<String, NexxusError> {
     Ok(vstr.to_string())
 }
 
-pub fn install_update(new_bytes: &[u8], signature_hex: &str, current_bin: &Path) -> Result<PathBuf, NexxusError> {
-    verify_release(new_bytes, signature_hex)?;
+pub fn install_update(
+    new_bytes: &[u8],
+    asset_name: &str,
+    manifest: &[u8],
+    minisig_b64: &str,
+    current_bin: &Path,
+) -> Result<PathBuf, NexxusError> {
+    verify_release_manifest(new_bytes, asset_name, manifest, minisig_b64)?;
     if new_bytes.len() < 1024 {
         return Err(NexxusError::Io("suspiciously small release binary".into()));
     }
@@ -253,8 +288,8 @@ mod tests {
         assert!(vk.verify(&bad, &sig).is_err());
 
         // verify_release падает на битую подпись / левый ключ
-        assert!(verify_release(msg, &hex::encode([0u8; 64])).is_err());
-        assert!(verify_release(msg, "zz").is_err());
+        // P0-7: legacy ed25519 verify_release удалён; негативные кейсы манифеста:
+        assert!(verify_release_manifest(msg, "no-such-asset", b"manifest", "bad-sig").is_err());
     }
 
     #[test]
@@ -265,8 +300,27 @@ mod tests {
         // подпись валидна только под release pubkey — для теста install
         // используем verify отдельно; здесь проверяем rollback-логику через
         // фальшивую подпись: install должен упасть и НЕ трогать старый бинарь
-        let res = install_update(b"new-bytes", &hex::encode([1u8; 64]), &bin);
+        let res = install_update(b"new-bytes", "nexxusd", b"manifest", "minisig", &bin);
         assert!(res.is_err(), "bad signature must abort");
         assert_eq!(std::fs::read(&bin).unwrap(), b"old-binary", "old binary intact after failed verify");
+    }
+
+    #[test]
+    fn p0_7_manifest_parsing_and_semver() {
+        let asset = b"fake-binary-bytes-nexxusd".to_vec();
+        let good_hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&asset))
+        };
+        let manifest = format!("{good_hash}  nexxusd-linux-x86_64\n");
+        assert!(manifest.contains("nexxusd-linux-x86_64"));
+        let tampered = b"tampered".to_vec();
+        {
+            use sha2::Digest;
+            assert_ne!(hex::encode(sha2::Sha256::digest(&tampered)), good_hash);
+        }
+        assert_eq!(version_tuple("1.2.3-rc1"), Some((1, 2, 3)));
+        assert!(is_newer((2, 0, 0), (1, 9, 9)));
+        assert!(!is_newer((1, 9, 9), (2, 0, 0)));
     }
 }
