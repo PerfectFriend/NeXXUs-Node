@@ -62,10 +62,10 @@ ADR-0011 (`docs/adr/0011-wire-v4.md`) — дизайн wire v4, вопросы �
 | P1-4 smp_inbox unbounded | **закрыт** | `a511b39`: bounded channel(1024), дроп при переполнении + метрика `smp_dropped` |
 | P0-3 vault v3 (Argon2id, ≥10 символов, decoy) | **частично** | C-9 закрыт ранее; полный v3-формат с пароль-фразой — следующий цикл |
 | P0-7 update.rs vs CI minisign | **закрыт** | `bf88dee`: self-update на minisign SHA256SUMS-манифесте (тот же pubkey, что в CI) + sha256 ассета по манифесту + semver anti-rollback; тест `p0_7_manifest_parsing_and_semver` |
-| P1-5 wire-v4 по умолчанию | **открыт** | mixed-mode/auto-upgrade — следующий цикл |
+| P1-5 wire-v4 по умолчанию | **частично закрыт** | `ca61058`: wire-v4 в default features, v4 listener на порту 4002 по умолчанию (mixed-mode с v3; NEXXUS_P2P_V4_PORT=0 отключает). Остаток: авто-upgrade v3→v4 на одном порту — следующий цикл |
 | P1-9 роли токена API | **закрыт** | `226df2b`: admin (`~/.nexxus/api.token`) + read-only (`~/.nexxus/api.token.read`, 0600, env NEXXUS_API_TOKEN_READ_FILE); read-роль: только мониторинг-методы + /metrics, ct_eq; мутации отклоняются; тест `p1_9_read_token_allows_read_rejects_mutation` |
 | P1-10 потоковый upload/download | **частично закрыт** | `4e1ad81`: upload читает файл чанками через tokio::fs (RAM не растёт с размером файла), download пишет потоково с fsync, fetch шардов hedged-параллельно у всех пиров (futures_util::join_all). Остаток: чанк 256KiB–1MiB и сегментированный манифест — ломают формат манифеста, отдельный миграционный релиз |
 | P1-11/12 CI (deny, SHA-пин, fmt) | **закрыт** | `9493327`: все actions запинены по commit-SHA (проверено через git ls-remote), `cargo fmt --check` + `cargo deny` в rust-ci, `deny.toml` (permissive-only, deny GPL/AGPL), `continue-on-error` снят с android/tor-integration, у audit-ignores владелец+срок (2026-12-31). SBOM/provenance — остаток: `cargo-cyclonedx` + `actions/attest-build-provenance` в release-джобе |
 | P1-14 один UI/демон, archive | **открыт** | фаза 5 |
 
-Гейты на `4e1ad81`: `cargo test -p nexxus-node --features wire-v4` 0 failed; `cargo clippy -p nexxus-node --all-targets -- -D warnings` 0 ошибок; `check-tree-hygiene.sh` чист.
+Гейты на `ca61058`: `cargo test -p nexxus-node --features wire-v4` 0 failed; `cargo clippy -p nexxus-node --all-targets -- -D warnings` 0 ошибок; `check-tree-hygiene.sh` чист.
