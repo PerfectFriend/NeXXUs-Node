@@ -10,6 +10,10 @@
 # Обоснования по каждому ID — в docs/DEP-01-dependency-audit.md.
 # Перепроверять при каждом `cargo update -p arti-client`.
 
+
+# P1-11 (аудит 2026-11-23): у каждого ignore — владелец и срок пересмотра.
+# Владелец: @thomas (nexxusd). Срок: пересмотр при каждом `cargo update -p arti-client`
+# и не реже 2026-12-31; еженедельный `cargo audit` — cron в CI (rust-ci.yml, job rust-gates).
 [advisories]
 ignore = [
     # rsa 0.9.10 — Marvin Attack (timing key recovery); транзитивно через

@@ -14,19 +14,27 @@ jobs:
     name: test + clippy + audit + fuzz
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable (branch head)
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@8e5c1b06e3a0fd2c96bac3adb874c63aa660ea6a # v2.7.6
 
       - name: cargo test --workspace
         run: cargo test --workspace
 
+      - name: cargo fmt --check (P1-12)
+        run: cargo fmt --all -- --check
+
       - name: cargo clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo deny (licenses + sources, P1-11/P1-12)
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check
 
       - name: cargo build --release
         run: cargo build --release --workspace
@@ -62,9 +70,9 @@ jobs:
     name: nexxus-desktop tests + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable (branch head)
+      - uses: Swatinem/rust-cache@8e5c1b06e3a0fd2c96bac3adb874c63aa660ea6a # v2.7.6
       - name: Build deps for Tauri (Linux)
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
       - name: Frontend dist placeholder (src-tauri/gen is gitignored)
@@ -85,9 +93,9 @@ jobs:
     name: nexxus-wasm — сборка под wasm32 + тесты
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      - uses: Swatinem/rust-cache@8e5c1b06e3a0fd2c96bac3adb874c63aa660ea6a # v2.7.6
       - name: wasm32 target
         run: rustup target add wasm32-unknown-unknown
       - name: cargo test (host)
@@ -99,7 +107,7 @@ jobs:
     name: Secret scan (DoD RC1 — ни один секрет не в git/логах)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Gitleaks detect (full history)
