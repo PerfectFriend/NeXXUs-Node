@@ -65,7 +65,7 @@ ADR-0011 (`docs/adr/0011-wire-v4.md`) — дизайн wire v4, вопросы �
 | P1-5 wire-v4 по умолчанию | **открыт** | mixed-mode/auto-upgrade — следующий цикл |
 | P1-9 роли токена API | **закрыт** | `226df2b`: admin (`~/.nexxus/api.token`) + read-only (`~/.nexxus/api.token.read`, 0600, env NEXXUS_API_TOKEN_READ_FILE); read-роль: только мониторинг-методы + /metrics, ct_eq; мутации отклоняются; тест `p1_9_read_token_allows_read_rejects_mutation` |
 | P1-10 потоковый upload/download | **открыт** | фаза 4 |
-| P1-11/12 CI (deny, SBOM, SHA-пин) | **открыт** | фаза 3 |
+| P1-11/12 CI (deny, SHA-пин, fmt) | **закрыт** | `9493327`: все actions запинены по commit-SHA (проверено через git ls-remote), `cargo fmt --check` + `cargo deny` в rust-ci, `deny.toml` (permissive-only, deny GPL/AGPL), `continue-on-error` снят с android/tor-integration, у audit-ignores владелец+срок (2026-12-31). SBOM/provenance — остаток: `cargo-cyclonedx` + `actions/attest-build-provenance` в release-джобе |
 | P1-14 один UI/демон, archive | **открыт** | фаза 5 |
 
-Гейты на `226df2b`: `cargo test -p nexxus-node --features wire-v4` 0 failed; `cargo clippy -p nexxus-node --all-targets -- -D warnings` 0 ошибок; `check-tree-hygiene.sh` чист.
+Гейты на `9493327`: `cargo test -p nexxus-node --features wire-v4` 0 failed; `cargo clippy -p nexxus-node --all-targets -- -D warnings` 0 ошибок; `check-tree-hygiene.sh` чист.
