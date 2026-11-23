@@ -18,8 +18,45 @@ use sha2::{Digest, Sha256};
 use crate::net::network::P2pNetwork;
 use crate::storage::ChunkStore;
 
-/// Chunk size for vault slicing (README: exactly 16 KB micro-blocks).
-pub const CHUNK_SIZE: usize = 16384;
+/// Chunk size for vault slicing. P1-10 (аудит 2026-11-23): 256 KiB вместо 16 KiB —
+/// манифест хранит chunk_size, download читает его оттуда, старые файлы совместимы.
+/// Шард RS(4+2) = 64 KiB — comfortably внутри MAX_FRAME_LEN (4 MiB).
+pub const CHUNK_SIZE: usize = 256 * 1024;
+
+/// P1-10: порог сегментации манифеста — при большем числе чанков entries выносятся
+/// в отдельные meta-сегменты `manifest_{root}_seg_{i}` (каждый со своим SHA256),
+/// корневой манифест хранит только список сегментов. Старые манифесты (inline
+/// "chunks") читаются как раньше.
+pub const MANIFEST_SEGMENT_CHUNKS: usize = 512;
+
+fn seg_key(root_hex: &str, i: usize) -> String {
+    format!("manifest_{root_hex}_seg_{i}")
+}
+
+/// Все chunk entries манифеста: из сегментов (с проверкой хэша) или inline (legacy).
+pub fn manifest_chunks(store: &ChunkStore, manifest: &Value, root_hex: &str) -> Result<Vec<Value>, NexxusError> {
+    if let Some(segs) = manifest["segments"].as_array() {
+        let mut out = Vec::new();
+        for s in segs {
+            let i = s["index"].as_u64().unwrap_or(0) as usize;
+            let want = s["hash"].as_str().unwrap_or("");
+            let raw = store
+                .get_meta(&seg_key(root_hex, i))?
+                .ok_or_else(|| NexxusError::Io(format!("missing manifest segment {i} for {root_hex}")))?;
+            if hex::encode(sha256(&raw)) != want {
+                return Err(NexxusError::Io(format!("manifest segment {i} hash mismatch for {root_hex}")));
+            }
+            let seg: Value = serde_json::from_slice(&raw)
+                .map_err(|e| NexxusError::Io(format!("corrupt manifest segment {i}: {e}")))?;
+            if let Some(chunks) = seg["chunks"].as_array() {
+                out.extend(chunks.iter().cloned());
+            }
+        }
+        Ok(out)
+    } else {
+        Ok(manifest["chunks"].as_array().cloned().unwrap_or_default())
+    }
+}
 
 fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
@@ -105,15 +142,36 @@ pub async fn upload_file(
     }
     let root = merkle::merkle_root(&chunk_roots);
     let root_hex = hex::encode(root);
-    let manifest = json!({
-        "root": root_hex,
-        "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        "file_id": file_id,
-        "key": hex::encode(file_key),
-        "total_len": total_len,
-        "chunk_size": CHUNK_SIZE,
-        "chunks": chunk_entries,
-    });
+    // P1-10: сегментированный манифест — при > MANIFEST_SEGMENT_CHUNKS чанков entries
+    // выносятся в сегменты по 512, каждый с SHA256; корень хранит только segments.
+    let manifest = if chunk_entries.len() > MANIFEST_SEGMENT_CHUNKS {
+        let mut segments = Vec::new();
+        for (si, seg) in chunk_entries.chunks(MANIFEST_SEGMENT_CHUNKS).enumerate() {
+            let seg_json = json!({ "segment": si, "chunks": seg }).to_string();
+            let seg_hash = hex::encode(sha256(seg_json.as_bytes()));
+            store.put_meta(&seg_key(&root_hex, si), seg_json.as_bytes())?;
+            segments.push(json!({ "index": si, "count": seg.len(), "hash": seg_hash }));
+        }
+        json!({
+            "root": root_hex,
+            "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            "file_id": file_id,
+            "key": hex::encode(file_key),
+            "total_len": total_len,
+            "chunk_size": CHUNK_SIZE,
+            "segments": segments,
+        })
+    } else {
+        json!({
+            "root": root_hex,
+            "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            "file_id": file_id,
+            "key": hex::encode(file_key),
+            "total_len": total_len,
+            "chunk_size": CHUNK_SIZE,
+            "chunks": chunk_entries,
+        })
+    };
     store.put_meta(&meta_key(&root_hex), manifest.to_string().as_bytes())?;
     Ok(json!({
         "root": root_hex,
@@ -149,7 +207,7 @@ pub async fn download_file(
     let total_len = manifest["total_len"].as_u64().unwrap_or(0) as usize;
     let mut out_data: Vec<u8> = Vec::with_capacity(total_len);
     let mut chunk_roots = Vec::new();
-    let chunk_list = manifest["chunks"].as_array().cloned().unwrap_or_default();
+    let chunk_list = manifest_chunks(store, &manifest, root_hex)?;
     for c in &chunk_list {
         let index = c["index"].as_u64().unwrap_or(0);
         let plain_len = c["plain_len"].as_u64().unwrap_or(0) as usize;
@@ -235,7 +293,7 @@ pub async fn rehydrate_manifest_from_mesh(
     manifest: &Value,
 ) -> Result<Value, NexxusError> {
     let root_hex = manifest["root"].as_str().unwrap_or("unknown");
-    let chunk_list = manifest["chunks"].as_array().cloned().unwrap_or_default();
+    let chunk_list = manifest_chunks(store, manifest, root_hex)?;
     let peers = net.known_peers().await;
 
     let mut total_shards = 0usize;
@@ -512,7 +570,7 @@ mod tests {
         let key = format!("manifest_{root}");
         let raw_manifest = net.store().get_meta(&key).unwrap().unwrap();
         let manifest: Value = serde_json::from_slice(&raw_manifest).unwrap();
-        let shard0_hex = manifest["chunks"][0]["shard_hashes"][0].as_str().unwrap();
+        let shard0_hex = manifest_chunks(net.store(), &manifest, &root).unwrap()[0]["shard_hashes"][0].as_str().unwrap().to_string();
         let shard0_hash = ChunkHash(<[u8; 32]>::try_from(hex::decode(shard0_hex).unwrap()).unwrap());
 
         // Delete primary shard 0 from store
@@ -535,5 +593,35 @@ mod tests {
         let r = run_por(&store).unwrap();
         assert_eq!(r["ok"], json!(true));
         assert!(r["elapsed_ms"].as_u64().unwrap() < 3000);
+    }
+
+    // P1-10: сегментированный манифест — segments читаются через manifest_chunks,
+    // хэш сегмента проверяется, legacy inline "chunks" работает как раньше.
+    #[test]
+    fn manifest_chunks_segments_and_legacy() {
+        let dir = tempdir().unwrap();
+        let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+        let root = "ab".repeat(32);
+        // два сегмента по 2 чанка
+        let mut segs = Vec::new();
+        for si in 0..2 {
+            let entries: Vec<Value> = (0..2)
+                .map(|k| json!({ "index": si * 2 + k, "plain_len": 1, "sealed_len": 29, "shard_hashes": [] }))
+                .collect();
+            let seg_json = json!({ "segment": si, "chunks": entries }).to_string();
+            let hash = hex::encode(sha256(seg_json.as_bytes()));
+            store.put_meta(&format!("manifest_{root}_seg_{si}"), seg_json.as_bytes()).unwrap();
+            segs.push(json!({ "index": si, "count": 2, "hash": hash }));
+        }
+        let manifest = json!({ "root": root, "segments": segs });
+        let all = manifest_chunks(&store, &manifest, &root).unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[3]["index"].as_u64().unwrap(), 3);
+        // битый хэш сегмента отклоняется
+        let bad = json!({ "root": root, "segments": [ { "index": 0, "count": 2, "hash": "00" } ] });
+        assert!(manifest_chunks(&store, &bad, &root).is_err());
+        // legacy inline
+        let legacy = json!({ "root": root, "chunks": [ { "index": 0 } ] });
+        assert_eq!(manifest_chunks(&store, &legacy, &root).unwrap().len(), 1);
     }
 }
