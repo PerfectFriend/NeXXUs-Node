@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
+    <!-- P1-14 (аудит 2026-11-23): CSP — без unsafe-inline/unsafe-eval, только self -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws://127.0.0.1:4010 wss://127.0.0.1:4010; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NeXXus Node Mobile</title>
