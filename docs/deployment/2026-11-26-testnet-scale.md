@@ -37,7 +37,11 @@ NEXXUS_EPOCH_SECS=3600                      # эпоха консенсуса
 NEXXUS_MAX_UP_KBPS / NEXXUS_MAX_DOWN_KBPS   # бенчмарк-лимиты, см. §5
 ```
 
-Подключение к сети: `nexxusd connect <seed-addr:4001>` или bootstrap-реестр. Проверка: `nexxusd status`, `node_peers` через WS API.
+Запуск демона: `nexxusd serve <store-path>`; порты — **не** CLI-флагами, а env/конфигом (`NEXXUS_LISTEN`, `NEXXUS_API_ADDR`), иначе биндится дефолт 4001/4010:
+```bash
+NEXXUS_SEED_PIN=****** NEXXUS_LISTEN=0.0.0.0:4001 NEXXUS_API_ADDR=127.0.0.1:4010 nexxusd serve ~/.nexxus/store.redb
+```
+Подключение к сети: `nexxusd peer connect <seed-addr:4001>` или bootstrap-реестр. Проверка: `nexxusd status`, `node_peers` через WS API.
 
 ## 3. Мобильные клиенты
 
