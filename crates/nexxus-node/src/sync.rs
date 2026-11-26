@@ -47,12 +47,14 @@ impl SyncEngine {
 
     /// Scans the drive directory, identifies new/modified files, and syncs them to the vault.
     pub async fn scan_and_sync(&self) -> Result<SyncReport, NexxusError> {
-        if !self.drive_path().exists() {
-            std::fs::create_dir_all(self.drive_path())
+        if !tokio::fs::try_exists(self.drive_path()).await
+            .map_err(|e| NexxusError::Io(format!("stat drive dir: {e}")))?
+        {
+            tokio::fs::create_dir_all(self.drive_path()).await
                 .map_err(|e| NexxusError::Io(format!("create drive dir: {e}")))?;
         }
 
-        let canonical_base = self.drive_path().canonicalize()
+        let canonical_base = tokio::fs::canonicalize(self.drive_path()).await
             .map_err(|e| NexxusError::Io(format!("canonicalize drive dir: {e}")))?;
 
         let mut scanned = 0usize;
@@ -60,9 +62,9 @@ impl SyncEngine {
         let mut total_bytes = 0u64;
         let mut errors = Vec::new();
 
-        let entries = walk_dir_safe(&canonical_base, 0, 16);
+        let entries = walk_dir_safe(&canonical_base, 0, 16).await;
         for path in entries {
-            let meta = match std::fs::symlink_metadata(&path) {
+            let meta = match tokio::fs::symlink_metadata(&path).await {
                 Ok(m) => m,
                 Err(e) => {
                     errors.push(format!("{}: metadata error {e}", path.display()));
@@ -105,7 +107,7 @@ impl SyncEngine {
                         Ok(p) => {
                             if p.size_bytes != size || p.mtime_unix != mtime_unix {
                                 // Potential change: verify via content hash
-                                let hash = compute_file_sha256(&path)?;
+                                let hash = compute_file_sha256(&path).await?;
                                 current_hash_hex = Some(hash.clone());
                                 p.content_hash_hex.is_empty() || p.content_hash_hex != hash
                             } else {
@@ -121,7 +123,7 @@ impl SyncEngine {
             if needs_sync {
                 let content_hash = match current_hash_hex {
                     Some(h) => h,
-                    None => compute_file_sha256(&path)?,
+                    None => compute_file_sha256(&path).await?,
                 };
 
                 match crate::vault::upload_file(&self.network, &self.store, &path).await {
@@ -186,14 +188,14 @@ pub fn default_drive_dir() -> PathBuf {
     PathBuf::from(home).join(".nexxus").join("drive")
 }
 
-fn compute_file_sha256(path: &Path) -> Result<String, NexxusError> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)
+async fn compute_file_sha256(path: &Path) -> Result<String, NexxusError> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await
         .map_err(|e| NexxusError::Io(format!("open for hash {}: {e}", path.display())))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = file.read(&mut buf)
+        let n = file.read(&mut buf).await
             .map_err(|e| NexxusError::Io(format!("read for hash {}: {e}", path.display())))?;
         if n == 0 {
             break;
@@ -204,15 +206,25 @@ fn compute_file_sha256(path: &Path) -> Result<String, NexxusError> {
 }
 
 /// H-24: Safe directory traversal preventing symlink traversal, symlink escapes, and cycles.
-fn walk_dir_safe(dir: &Path, depth: usize, max_depth: usize) -> Vec<PathBuf> {
+/// Async: не блокирует tokio runtime (аудит 2026-11-23, sync без std::fs в async-путях).
+fn walk_dir_safe<'a>(
+    dir: &'a Path,
+    depth: usize,
+    max_depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<PathBuf>> + Send + 'a>> {
+    Box::pin(async move {
     if depth > max_depth {
         return Vec::new();
     }
     let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
+    let entries = match tokio::fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut entries = entries;
+    while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let meta = match std::fs::symlink_metadata(&path) {
+            let meta = match tokio::fs::symlink_metadata(&path).await {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -223,11 +235,11 @@ fn walk_dir_safe(dir: &Path, depth: usize, max_depth: usize) -> Vec<PathBuf> {
             if meta.is_file() {
                 files.push(path);
             } else if meta.is_dir() {
-                files.extend(walk_dir_safe(&path, depth + 1, max_depth));
+                files.extend(walk_dir_safe(&path, depth + 1, max_depth).await);
             }
-        }
     }
     files
+    })
 }
 
 #[cfg(test)]
