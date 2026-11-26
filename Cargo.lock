@@ -2437,6 +2437,7 @@ name = "nexxus-core"
 version = "0.228.0"
 dependencies = [
  "aes-gcm",
+ "argon2",
  "bip39",
  "chacha20poly1305",
  "curve25519-dalek 4.1.3",
