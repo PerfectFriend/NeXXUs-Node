@@ -187,6 +187,10 @@ pub struct Metrics {
     pub rl_wait_ms: AtomicU64,
     /// H-4: отправлено keepalive-ping'ов ( liveness established-соединений).
     pub keepalives_sent: AtomicU64,
+    /// P1-5 deprecation: принято v3-соединений (wire v3 deprecated, миграция на v4).
+    pub v3_conns: AtomicU64,
+    /// P1-5 deprecation: последний warn в лог (unix secs), rate-limit.
+    pub v3_warn_last: AtomicU64,
 }
 
 impl Metrics {
@@ -212,6 +216,7 @@ impl Metrics {
             "peers_evicted": self.peers_evicted.load(Ordering::Relaxed),
             "req_timeouts": self.req_timeouts.load(Ordering::Relaxed),
             "smp_dropped": self.smp_dropped.load(Ordering::Relaxed),
+            "v3_conns": self.v3_conns.load(Ordering::Relaxed),
             "rl_wait_ms": self.rl_wait_ms.load(Ordering::Relaxed),
             "keepalives_sent": self.keepalives_sent.load(Ordering::Relaxed),
         })
@@ -948,6 +953,23 @@ impl P2pNetwork {
                             _ => {}
                         }
                     }
+                }
+                // P1-5 deprecation v3: NEXXUS_P2P_V3_ALLOW=0 жёстко дропает v3 (только NXV4),
+                // иначе считаем и rate-limited warn'им (раз в 300с).
+                let v3_allowed = std::env::var("NEXXUS_P2P_V3_ALLOW").map(|v| v != "0").unwrap_or(true);
+                if !v3_allowed {
+                    net.metrics.conns_rejected_ip.fetch_add(1, Ordering::Relaxed);
+                    crate::log_ev!("warn", "conn.v3.rejected", "addr" => addr.to_string(), "reason" => "v3 disabled");
+                    return;
+                }
+                let n = net.metrics.v3_conns.fetch_add(1, Ordering::Relaxed) + 1;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let last = net.metrics.v3_warn_last.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= 300
+                    && net.metrics.v3_warn_last.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+                {
+                    crate::log_ev!("warn", "conn.v3.deprecated", "addr" => addr.to_string(), "total_v3" => n.to_string());
                 }
                 if let Err(e) = net.handle_connection(stream, peer).await {
                     let _ = e;
