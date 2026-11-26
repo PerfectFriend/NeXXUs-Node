@@ -61,15 +61,18 @@
 - TON contracts — прототипы Func, нужен Tolk/Func миграция и деплой (C-6/7/8 by design).
 
 ### unbuilt (задумано, не сделано) — план разработки по приоритетам
-1. **Ревок 3 TG bot-токенов** (bot-ID `8853927147`, `8883516682`, `8896772547`) через @BotFather + удалить `~/.hermes/secrets/cathedral_bot_token.bak-tokenrotate-20261117` — владелец, ждёт телегу.
-2. **H-3/H-4/H-8 peer-management**: keep_alive rewrite + connection_rate_limit — вне RC1, следующий цикл.
-3. **Deprecation v3** после mixed-mode (`1be7a67`): план отключения v3, окно миграции.
-4. **Android**: токен в EncryptedSharedPreferences/Keystore вместо поля ввода; CI — `setup-android-sdk` action (сейчас не резолвится).
-5. **Windows CI**: webkit2gtk на раннере для Tauri.
-6. **P0-3 остаток**: полный vault v3-формат с пароль-фразой (сейчас Argon2id+decoy закрыто частично).
-7. **TON**: миграция contracts на Tolk, on-chain деплой, EpochController wiring к `EpochFinalize`.
-8. **sync**: убрать `std::fs` из async-путей, версионирование файлов (сейчас один индекс на файл), пустые файлы пропускаются.
-9. **panic.state** рядом со стором — без TPM кулдаун сбрасывается удалением файла (задокументировано).
+
+**Обновлено 2026-11-26 (HEAD `727d449`)**: пп. 2–6, 8 закрыты — см. ниже. Остаётся:
+1. **TON contracts**: миграция FunC→Tolk, on-chain деплой, wiring EpochController к `EpochFinalize` — нужны deploy-ключи и сеть, единственный крупный unbuilt-остаток.
+2. **panic.state** рядом со стором — без TPM кулдаун сбрасывается удалением файла (задокументировано, by design).
+3. sync: версионирование индекс-файлов (сейчас один индекс на файл), пустые файлы пропускаются.
+
+**Закрыто после ревизии:**
+- `311d066` Android: токен в EncryptedSharedPreferences (Keystore), JS-мост `window.Android`, prefill + «Забыть токен»; APK BUILD SUCCESSFUL.
+- `01acabe` CI: `android-actions/setup-android` → v4.0.4 (`be39fa8`); webkit2gtk-блокер устарел (все джобы ubuntu-latest).
+- `ae45e7b` sync: `std::fs` убран из async-путей (tokio::fs, boxed async walk_dir_safe).
+- `6983270` deprecation v3: метрика `v3_conns`, warn `conn.v3.deprecated` (300с), `NEXXUS_P2P_V3_ALLOW=0` дропает v3; ADR-0011 дополнен.
+- `727d449` **P0-3 vault v3**: Argon2id(64MiB,t=3) из passphrase+PIN, passphrase ≥10, 3 decoy-записи, ct_eq verifier, DoS-клемпы; тесты 4/4.
 
 ## 4. Риски
 - До ревоков токены валидны (хоть и вычищены из истории) — кто скачал старый клон до 2026-11-23, имеет их.
