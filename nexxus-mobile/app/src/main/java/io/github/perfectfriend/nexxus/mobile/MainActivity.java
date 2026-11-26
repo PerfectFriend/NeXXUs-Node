@@ -25,6 +25,8 @@ public class MainActivity extends AppCompatActivity {
         web.getSettings().setAllowUniversalAccessFromFileURLs(false);
         // Только наш WebViewClient: внешние URL не открываются (никаких deeplink'ов наружу).
         web.setWebViewClient(new WebViewClient());
+        // P1-14: токен живёт в EncryptedSharedPreferences (Keystore), мост для WebView.
+        web.addJavascriptInterface(new TokenStore.Bridge(new TokenStore(this)), "Android");
         web.loadUrl("file:///android_asset/www/index.html");
         setContentView(web);
     }

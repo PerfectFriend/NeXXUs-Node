@@ -29,6 +29,21 @@ function call(method, params) {
   });
 }
 
+// P1-14 (аудит 2026-11-23): токен хранится в Android Keystore (EncryptedSharedPreferences),
+// мост window.Android. Поле ввода только для первого ввода — дальше prefill из хранилища.
+function androidBridge() { return (typeof Android !== 'undefined') ? Android : null; }
+window.addEventListener('load', () => {
+  const a = androidBridge();
+  if (a) { const t = a.getToken(); if (t) $('token').value = t; }
+});
+
+$('btn-forget-token') && ($('btn-forget-token').onclick = () => {
+  const a = androidBridge();
+  if (a) a.clearToken();
+  $('token').value = '';
+  log('токен удалён из Keystore', 'ok');
+});
+
 $('btn-connect').onclick = () => {
   const addr = $('addr').value.trim();
   const token = $('token').value.trim();
@@ -51,6 +66,8 @@ $('btn-connect').onclick = () => {
     try {
       await call('auth', { token });
       log('auth OK', 'ok');
+      const a = androidBridge();
+      if (a) a.setToken(token); // токен ушёл в Keystore, в DOM не храним
       const s = await call('node_status');
       out(s);
     } catch (e) { log('auth failed: ' + e, 'err'); }
